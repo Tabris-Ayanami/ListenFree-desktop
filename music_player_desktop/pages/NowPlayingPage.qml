@@ -105,6 +105,7 @@ Item {
     signal equalizerRequested
     signal informationRequested
     signal downloadRequested
+    signal favoriteRequested(var anchorItem)
     signal lyricsMatchRequested
     property url motionSource: ""
     property url artworkSource: Qt.resolvedUrl("../assets/album_Cover_2@2x.png")
@@ -278,7 +279,7 @@ Item {
             height: 44 * page.controlScale
             Column {
                 anchors.left: parent.left
-                anchors.right: mediaAction.left
+                anchors.right: page.radioContent ? mediaAction.left : favoriteAction.left
                 anchors.rightMargin: 12
                 spacing: 2 * page.controlScale
                 Text {
@@ -299,6 +300,19 @@ Item {
                     font.pixelSize: 12 * page.controlScale
                     elide: Text.ElideRight
                 }
+            }
+            RoundIconButton {
+                id: favoriteAction
+                objectName: "nowPlayingFavoriteButton"
+                visible: !page.radioContent
+                anchors.right: mediaAction.left
+                anchors.rightMargin: 8 * page.controlScale
+                anchors.verticalCenter: parent.verticalCenter
+                diameter: 32 * page.controlScale
+                kind: "star"
+                darkMode: true
+                tooltip: qsTr("收藏到“我的收藏”")
+                onClicked: page.favoriteRequested(favoriteAction)
             }
             RoundIconButton {
                 id: mediaAction
@@ -416,6 +430,19 @@ Item {
             Text { id: volumeLabel; width: 22 * page.controlScale; text: Math.round(page.volumeValue * 100); horizontalAlignment: Text.AlignRight; color: "#f1edef"; font.pixelSize: 12 * page.controlScale; anchors.verticalCenter: parent.verticalCenter }
         }
         RoundIconButton {
+            id: overflowFavoriteAction
+            objectName: "overflowFavoriteButton"
+            visible: !page.radioContent && page.overflowStyle && opacity > 0
+            enabled: page.controlsShown
+            opacity: page.controlsOpacity
+            x: overflowMediaAction.x - width - 10; y: overflowMediaAction.y
+            diameter: 32; kind: "star"
+            transparentSurface: true; glyphColor: "white"; darkMode: true
+            tooltip: qsTr("收藏到“我的收藏”")
+            onClicked: page.favoriteRequested(overflowFavoriteAction)
+        }
+        RoundIconButton {
+            id: overflowMediaAction
             objectName: "overflowMediaAction"
             visible: !page.radioContent && page.overflowStyle && opacity > 0
             enabled: page.controlsShown

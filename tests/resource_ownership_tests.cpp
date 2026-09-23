@@ -201,6 +201,10 @@ private Q_SLOTS:
             {"durationMs",qint64(123456)},{"duration","2:03"},{"localPath","C:/a.mp3"},{"artwork","image://covers/a"}}};
         TrackListModel model; QueueModel queue;
         model.setRows(rows); queue.setRows(rows);
+        auto snapshot=model.snapshotRows();
+        QCOMPARE(snapshot,rows);
+        snapshot[0]=QVariantMap{{"trackId","other"},{"title","snapshot changed"}};
+        QCOMPARE(model.get(0).value("trackId").toString(),QString("a"));
         QCOMPARE(model.get(0),queue.get(0)); QCOMPARE(model.get(0).value("duration").toLongLong(),123456);
         auto changed=rows[0].toMap();changed["title"]="更改";rows[0]=changed;
         QCOMPARE(model.get(0).value("title").toString(),QString("曲目"));
@@ -208,6 +212,66 @@ private Q_SLOTS:
         QCOMPARE(queue.get(0).value("title").toString(),QString("曲目"));
         model.setTracks({});QCOMPARE(model.rowCount(),0);QVERIFY(model.get(0).isEmpty());
         model.setRows(rows);QCOMPARE(model.rowCount(),1);model.setRows({});QCOMPARE(model.rowCount(),0);
+    }
+    void appendRowPreservesRolesAndAvoidsReset() {
+        using namespace listenfree::qmlbridge;
+        TrackListModel model;
+        QSignalSpy inserted(&model,&QAbstractItemModel::rowsInserted);
+        QSignalSpy reset(&model,&QAbstractItemModel::modelReset);
+        QSignalSpy countChanged(&model,&TrackListModel::countChanged);
+        QVERIFY(inserted.isValid()); QVERIFY(reset.isValid()); QVERIFY(countChanged.isValid());
+        QCOMPARE(model.rowCount(),0);
+        const QVariantMap first{{"trackId","first"},{"title","曲目"},{"artist","歌手"},
+            {"album","专辑"},{"durationMs",qint64(123456)},{"localPath","C:/a.mp3"},
+            {"artwork","image://covers/a"},{"songKey","local:a"}};
+        QVERIFY(model.appendRow(first));
+        QCOMPARE(model.rowCount(),1);
+        QCOMPARE(inserted.size(),1); QCOMPARE(reset.size(),0); QCOMPARE(countChanged.size(),1);
+        QCOMPARE(inserted.at(0).at(1).toInt(),0); QCOMPARE(inserted.at(0).at(2).toInt(),0);
+        const auto roles=model.roleNames();
+        const auto row=model.index(0,0);
+        for(auto it=roles.cbegin();it!=roles.cend();++it)
+            QCOMPARE(model.get(0).value(QString::fromUtf8(it.value())),model.data(row,it.key()));
+        QCOMPARE(model.data(row,TrackListModel::DurationRole).toLongLong(),qint64(123456));
+        QCOMPARE(model.snapshotRows().at(0).toMap(),first);
+        auto snapshot=model.snapshotRows();
+        const QVariantMap second{{"trackId","second"},{"title","下首"},{"durationMs",qint64(240000)}};
+        QVERIFY(model.appendRow(second));
+        QCOMPARE(model.rowCount(),2); QCOMPARE(inserted.size(),2);
+        QCOMPARE(inserted.at(1).at(1).toInt(),1); QCOMPARE(inserted.at(1).at(2).toInt(),1);
+        QCOMPARE(reset.size(),0); QCOMPARE(countChanged.size(),2);
+        QCOMPARE(snapshot.size(),1); QCOMPARE(snapshot.at(0).toMap(),first);
+        QCOMPARE(model.snapshotRows().at(1).toMap(),second);
+    }
+    void sameOrderRowReplacementPreservesPersistentIndexes() {
+        using namespace listenfree::qmlbridge;
+        const QVariantList original{
+            QVariantMap{{"trackId","a"},{"title","A"},{"durationMs",1000},{"extra","old"}},
+            QVariantMap{{"trackId","b"},{"title","B"},{"durationMs",2000},{"extra","old"}},
+            QVariantMap{{"trackId","c"},{"title","C"},{"durationMs",3000},{"extra","old"}}};
+        TrackListModel model;
+        model.setRows(original);
+        const QPersistentModelIndex anchored(model.index(1, 0));
+        QSignalSpy reset(&model, &QAbstractItemModel::modelReset);
+        QSignalSpy updated(&model, &QAbstractItemModel::dataChanged);
+        QSignalSpy countChanged(&model, &TrackListModel::countChanged);
+        auto replacement = original;
+        auto middle = replacement.at(1).toMap();
+        middle["durationMs"] = 2500;
+        middle["extra"] = "new";
+        replacement[1] = middle;
+        QVERIFY(model.replaceRowsSameOrder(replacement, {1}));
+        QVERIFY(anchored.isValid());
+        QCOMPARE(anchored.row(), 1);
+        QCOMPARE(model.data(anchored, TrackListModel::TrackIdRole).toString(), QString("b"));
+        QCOMPARE(model.data(anchored, TrackListModel::DurationRole).toInt(), 2500);
+        QCOMPARE(model.snapshotRows(), replacement);
+        QCOMPARE(reset.size(), 0);
+        QCOMPARE(updated.size(), 1);
+        QCOMPARE(updated.at(0).at(0).toModelIndex().row(), 1);
+        QCOMPARE(countChanged.size(), 0);
+        QVERIFY(!model.replaceRowsSameOrder({}, {}));
+        QCOMPARE(model.snapshotRows(), replacement);
     }
     void remoteDecodeErrorAndCancellation() {
         QTcpServer server; QVERIFY(server.listen(QHostAddress::LocalHost));

@@ -11,14 +11,18 @@
 #include <QFutureWatcher>
 #include <QCache>
 #include <QElapsedTimer>
+#include <QHash>
 #include <QNetworkAccessManager>
 #include <QPointer>
+#include <QStringList>
 #include <QTemporaryDir>
 #include <QSet>
+#include <memory>
 #include <qmmpui/playlistmodel.h>
 #include <qmmpui/qmmpuisettings.h>
 
 class QTimer;
+class CollectionCoverIndex;
 
 namespace listenfree::qmlbridge {
 class PortableSession final : public QObject {
@@ -44,9 +48,9 @@ class PortableSession final : public QObject {
     Q_PROPERTY(QString currentTrackId READ currentTrackId NOTIFY currentTrackChanged)
     Q_PROPERTY(QString dynamicArtworkUrl READ dynamicArtworkUrl NOTIFY artworkChanged)
     Q_PROPERTY(bool dynamicArtworkEnabled READ dynamicArtworkEnabled WRITE setDynamicArtworkEnabled NOTIFY artworkChanged)
-    Q_PROPERTY(bool mixing READ mixing NOTIFY changed)
+    Q_PROPERTY(bool mixing READ mixing NOTIFY progressChanged)
     Q_PROPERTY(QString state READ state NOTIFY changed)
-    Q_PROPERTY(qint64 position READ position NOTIFY changed)
+    Q_PROPERTY(qint64 position READ position NOTIFY progressChanged)
     Q_PROPERTY(qint64 duration READ duration NOTIFY changed)
     Q_PROPERTY(bool seekable READ seekable NOTIFY changed)
     Q_PROPERTY(bool live READ live NOTIFY currentTrackChanged)
@@ -54,7 +58,7 @@ class PortableSession final : public QObject {
     Q_PROPERTY(float volume READ volume WRITE setVolume NOTIFY changed)
     Q_PROPERTY(QString errorMessage READ errorMessage NOTIFY changed)
     Q_PROPERTY(QString playbackMode READ playbackMode NOTIFY queueChanged)
-    Q_PROPERTY(int currentLyricIndex READ currentLyricIndex NOTIFY changed)
+    Q_PROPERTY(int currentLyricIndex READ currentLyricIndex NOTIFY progressChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY searchResultsChanged)
     Q_PROPERTY(QVariantList searchResults READ searchResults NOTIFY searchResultsChanged)
     Q_PROPERTY(QString searchCategory READ searchCategory WRITE setSearchCategory NOTIFY searchResultsChanged)
@@ -141,6 +145,10 @@ public:
                     SourceController& sources, QObject* parent = nullptr);
     ~PortableSession() override;
     bool ready() const { return ready_; }
+    // Diagnostic for catalog A/B tests; a sparse reload should hydrate only
+    // the affected database rows rather than the entire library.
+    qsizetype lastCatalogHydratedRows() const noexcept { return lastCatalogHydratedRows_; }
+    bool lastCatalogUsedDelta() const noexcept { return lastCatalogUsedDelta_; }
     bool mixing() const { return smartTransition_ && (player_.mixing() ||
         (mixManual_ && !mixTarget_.isEmpty() && state()=="Playing")); }
     bool mockMode() const { return false; }
@@ -149,6 +157,7 @@ public:
     QVariantList songs() const { return songs_; }
     QVariantList albums() const { return albums_; }
     QVariantList artists() const { return artists_; }
+    std::shared_ptr<CollectionCoverIndex> collectionCoverIndex() const { return collectionCoverIndex_; }
     QVariantList emptyList() const { return {}; }
     QVariantList comments() const { return comments_; }
     bool commentsBusy() const { return commentsBusy_; }
@@ -195,7 +204,10 @@ public:
     Q_INVOKABLE bool selectOutput(const QString& id);
     Q_INVOKABLE void refreshDevices();
     Q_INVOKABLE void clearShuffleHistory();
+    // Explicit refresh also checks filesystem-derived local artwork versions.
     Q_INVOKABLE void reload();
+    // Use after a known catalog database commit; the journal then bounds reads.
+    void reloadCatalogChanges();
     void redirectDuplicates(const QVariantList& redirects);
     void prepareDuplicateMerge(const QVariantList& groups);
     Q_INVOKABLE void play();
@@ -207,6 +219,7 @@ public:
     Q_INVOKABLE void setVolume(float value);
     Q_INVOKABLE void toggleMute();
     Q_INVOKABLE bool openTrack(const QVariantMap& track);
+    Q_INVOKABLE bool replaceQueueWithList(const QVariantList& tracks, const QVariantMap& selectedTrack);
     Q_INVOKABLE bool enqueueTrack(const QVariantMap& track, bool next = false);
     Q_INVOKABLE void openLocal(const QString& path);
     Q_INVOKABLE void openUrl(const QUrl& url);
@@ -242,6 +255,7 @@ signals:
     void suggestionsChanged();
     void devicesChanged();
     void changed();
+    void progressChanged();
     void catalogChanged();
     void localLibraryChanged();
     void currentTrackChanged();
@@ -253,6 +267,7 @@ signals:
     void notice(const QString& message);
     void artworkChanged();
 private:
+    void scheduleReload(bool allowDelta);
     QVariantList metadataCandidates_;
     QPointer<QNetworkReply> metadataMatchReply_;
     QPointer<QNetworkReply> metadataArtworkReply_;
@@ -291,6 +306,7 @@ private:
     infrastructure::database::Database& database_;
     QString databasePath_;
     SourceController& sources_;
+    std::shared_ptr<CollectionCoverIndex> collectionCoverIndex_;
     QmmpUiSettings uiSettings_;
     PlayListModel navigation_{"ListenFree"};
     QHash<PlayListTrack*, QVariantMap> entries_;
@@ -309,11 +325,30 @@ private:
     TrackListModel tracks_;
     QueueModel queueModel_;
     QVariantList songs_, albums_, artists_, queueView_, lyrics_, searchResults_;
+    QSet<QString> indexedCoverIdentities_;
     struct LibraryLoadResult {
-        std::vector<domain::Track> tracks;
+        QVariantList songs;
+        QVariantList albums;
+        QVariantList artists;
+        QHash<QString, QStringList> coverCandidates;
+        QSet<QString> coverIdentities;
         std::vector<domain::Track> repaired;
+        quint64 baseCatalogRevision{};
+        std::int64_t databaseRevision{-1};
+        qsizetype hydratedRows{};
+        bool valid{};
+        bool noChanges{};
+        bool usedDelta{};
+        bool sameTrackOrder{};
+        QVector<int> changedTrackRows;
     };
     QFutureWatcher<LibraryLoadResult> libraryLoad_;
+    quint64 catalogRevision_{};
+    std::int64_t databaseRevision_{-1};
+    qsizetype lastCatalogHydratedRows_{};
+    bool lastCatalogUsedDelta_{};
+    bool catalogDatabaseOrder_{true};
+    QSet<QString> pendingRepairedTrackIds_;
     QNetworkAccessManager network_;
     online::LyricSearch lyricSearch_{network_};
     QString platform_{"kw"};
@@ -348,13 +383,16 @@ private:
     int consecutiveErrors_{0};
     int prematureNetworkRetries_{0};
     bool batching_{false};
+    QSet<QString> batchSongKeys_;
     bool loading_{false}, mediaReady_{false}, ready_{false}, searchBusy_{false}, stopped_{false}, reloadAgain_{false};
+    bool reloadAgainForceFull_{false};
     bool libraryReloadActive_{false};
     quint64 generation_{0};
     quint64 seekRequest_{0};
     bool smartTransition_{false};
     bool mixAttempted_{false}, mixManual_{false}, mixArmed_{false}, mixAdvance_{true};
-    QString mixTarget_, mixResolution_;
+    QString mixTarget_, mixResolution_, mixReadyUrl_;
+    QVariantMap mixReadyHeaders_;
     int mixIndex_{-1};
     QElapsedTimer mixPreparationClock_;
     qint64 mixCooldown_{0};

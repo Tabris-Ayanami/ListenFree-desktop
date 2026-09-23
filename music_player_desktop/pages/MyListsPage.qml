@@ -37,13 +37,13 @@ Item {
     }
     function activateRadio(row) {
         if (row.kind === "podcast") podcastRequested(row)
-        else trackActivated(row)
+        else trackActivated(row, visibleRadioFavorites)
     }
     onCollectionTabChanged: grid.contentY = 0
     signal openCollection(string kind, string title, color tint)
     signal collectionTransitionRequested(string kind, string title, color tint, rect frameRect, rect artworkRect, url artworkSource, var artworkItem)
-    signal trackActivated(var track)
-    signal trackCommandRequested(string command, var track, int rowIndex)
+    signal trackActivated(var track, var playbackContext)
+    signal trackCommandRequested(string command, var track, int rowIndex, var playbackContext)
     signal trackSortRequested(string column, string order)
     signal createRequested(string name)
     signal updateRequested

@@ -75,6 +75,7 @@ Item {
     property var pendingPlaylistTracks: []
     readonly property var editablePlaylists: playlistController ? playlistController.playlists.filter(function(p) { return !p.reference }) : []
     property bool addPlaylistOpen: false
+    property bool addPlaylistCreateOnly: false
     property var onlineController: null
     property var settingsController: null
     EqualizerPopup { id: equalizerPopup; controller: shell.playerController }
@@ -109,8 +110,9 @@ Item {
     property bool animationsEnabled: true
     property string animationStyle: "Elegant"
     property bool sidebarCollapsed: false
-    property bool useBackendModels: false
-    property var queueSongs: playerController ? playerController.queueSongs : []
+    property bool useBackendModels: appController ? appController.mockMode === false : false
+    property var queueSongs: appController && appController.mockMode === true
+                             && !useBackendModels && playerController ? playerController.queueSongs : []
     property int refreshRateLimit: 60
     property real morphProgress: 0
     property real coverMorphProgress: 0
@@ -180,6 +182,7 @@ Item {
         lastNavigationRoute=currentRoute
         pageSearchQuery=filters[currentRoute] || ""
         if(currentRoute.indexOf("detail/")!==0)baseRoute=currentRoute
+        releaseInactiveCollectionRows()
         if (!settingsOpen) searchInput.text = currentRoute === "search" ? searchQuery : pageSearchQuery
     }
     onSettingsOpenChanged: {
@@ -202,6 +205,11 @@ Item {
     property int selectedCollectionCover: 1
     property url selectedCollectionArtwork: ""
     property var selectedCollectionRows: []
+    function releaseInactiveCollectionRows() {
+        if (currentRoute.indexOf("detail/") !== 0 && !collectionMorphClosing
+                && selectedCollectionRows && selectedCollectionRows.length)
+            selectedCollectionRows = []
+    }
     property string previousRoute: "library/albums"
     property bool selectedOnlineCollection: false
     property bool globalAlertOpen: false
@@ -237,7 +245,6 @@ Item {
         AppTheme.fontFamily = resolvedFontFamily(uiFontFamily)
         AppTheme.motionEnabled = animationsEnabled
         AppTheme.motionStyle = animationStyle
-        useBackendModels = appController ? appController.mockMode === false : false
     }
 
     onNowPlayingOpenChanged: if (nowPlayingOpen && playerController) playerController.requestArtwork()
@@ -432,32 +439,31 @@ Item {
         if (facade) facade.requestPlayback(command)
     }
 
-    function playTrack(track) {
-        if (playerController && track) { playerController.openTrack(track); return }
+    function playTrack(track, playbackContext) {
         if (playerController && track) {
-            if (track.localPath) {
-                playerController.openLocal(track.localPath)
-                playerController.play()
-                return
+            const behavior = settingsController
+                ? settingsController.value("playback.playActionBehavior", "AppendToQueue") : "AppendToQueue"
+            if (behavior === "ReplaceCurrentList" && playbackContext) {
+                const rows = typeof playbackContext.playbackRows === "function"
+                    ? playbackContext.playbackRows() : playbackContext
+                if (rows && rows.length && playerController.replaceQueueWithList(rows, track)) return
             }
-            if (track.remoteUrl) {
-                playerController.openUrl(track.remoteUrl)
-                playerController.play()
-                return
-            }
+            playerController.openTrack(track)
+            return
         }
         requestPlayback("playSong")
     }
 
     function removeQueue(index) {
-        const sidebarPosition = sidebarQueue ? sidebarQueue.contentY : 0
+        const queueView = useBackendModels && playerController ? sidebarBackendQueue : sidebarQueue
+        const sidebarPosition = queueView ? queueView.contentY : 0
         if (useBackendModels && playerController) {
             playerController.removeFromQueue(index)
             Qt.callLater(function() {
-                if (!sidebarQueue) return
-                sidebarQueue.forceLayout()
-                sidebarQueue.contentY = Math.max(0, Math.min(sidebarPosition,
-                                                            sidebarQueue.contentHeight - sidebarQueue.height))
+                if (!queueView) return
+                queueView.forceLayout()
+                queueView.contentY = Math.max(0, Math.min(sidebarPosition,
+                                                         queueView.contentHeight - queueView.height))
             })
             return
         }
@@ -466,10 +472,10 @@ Item {
         next.splice(index, 1)
         queueSongs = next
         Qt.callLater(function() {
-            if (!sidebarQueue) return
-            sidebarQueue.forceLayout()
-            sidebarQueue.contentY = Math.max(0, Math.min(sidebarPosition,
-                                                        sidebarQueue.contentHeight - sidebarQueue.height))
+            if (!queueView) return
+            queueView.forceLayout()
+            queueView.contentY = Math.max(0, Math.min(sidebarPosition,
+                                                     queueView.contentHeight - queueView.height))
         })
     }
 
@@ -622,6 +628,7 @@ Item {
         target: shell.playerController
         ignoreUnknownSignals: true
         function onTrackMetadataChanged(track) {
+            if (shell.currentRoute.indexOf("detail/") !== 0 || !shell.selectedCollectionRows.length) return
             const previous = shell.selectedCollectionRows.find(row => row.localPath && row.localPath.toLowerCase() === String(track.localPath).toLowerCase())
             if (previous && String(shell.selectedCollectionArtwork) === String(previous.artwork)) {
                 shell.selectedCollectionArtwork = track.artwork || ""
@@ -630,8 +637,9 @@ Item {
             shell.selectedCollectionRows=shell.selectedCollectionRows.map(row => row.localPath && row.localPath.toLowerCase()===String(track.localPath).toLowerCase()?Object.assign({},row,track):row)
         }
         function onCatalogChanged() {
-            if(shell.selectedOnlineCollection || (shell.collectionMorphKind!=="Album" && shell.collectionMorphKind!=="Artist"))return
-            const artist=shell.collectionMorphKind==="Artist"
+            if(shell.currentRoute!=="detail/album" && shell.currentRoute!=="detail/artist")return
+            if(shell.selectedOnlineCollection)return
+            const artist=shell.currentRoute==="detail/artist"
             shell.selectedCollectionRows=(shell.catalog.songs || []).filter(row =>
                 (artist ? (row.artist || qsTr("未知艺术家")) : (row.album || qsTr("未知专辑")))===shell.selectedCollectionTitle)
             const first=shell.selectedCollectionRows[0] || ({})
@@ -651,10 +659,10 @@ Item {
             facade.requestQueue("library.sort", column + ":" + order)
     }
 
-    function handleTrackCommand(command, track, rowIndex) {
+    function handleTrackCommand(command, track, rowIndex, playbackContext) {
         const payload = JSON.stringify({ track: track || {}, rowIndex: rowIndex })
         if (command === "play_now") {
-            playTrack(track)
+            playTrack(track, playbackContext)
         } else if (command === "play_next" || command === "add_to_queue" || command === "add_queue") {
             if (playerController) playerController.enqueueTrack(track, command === "play_next")
         } else if (command === "download") {
@@ -663,7 +671,7 @@ Item {
             if (track && track.radioId && radioController) radioController.toggleFavorite(track)
             else if (playlistController) playlistController.toggleTrackLiked(track)
         } else if (command === "add_to_playlist") {
-            pendingPlaylistTracks = [track]; addPlaylistOpen = true
+            pendingPlaylistTracks = [track]; addPlaylistCreateOnly = false; addPlaylistOpen = true
         } else if (command === "show_in_explorer") {
             if (playerController) playerController.showInExplorer(track)
         } else if (command === "remove_from_library") {
@@ -798,8 +806,8 @@ Item {
                 Component.onCompleted: { const position=shell.mosaicPosition; panX=position.x; panY=position.y }
                 onPanXChanged: shell.mosaicPosition=Qt.point(panX,panY)
                 onPanYChanged: shell.mosaicPosition=Qt.point(panX,panY)
-                onTrackActivated: track => shell.playTrack(track)
-                onTrackCommandRequested: (command,track,rowIndex) => shell.handleTrackCommand(command,track,rowIndex)
+                onTrackActivated: (track, playbackContext) => shell.playTrack(track, playbackContext)
+                onTrackCommandRequested: (command,track,rowIndex,playbackContext) => shell.handleTrackCommand(command,track,rowIndex,playbackContext)
                 onPlayAllRequested: tracks => { if (shell.playerController) shell.playerController.playAll(tracks) }
             }
         }
@@ -878,9 +886,91 @@ Item {
             SidebarButton { label: qsTr("我的收藏"); iconKind: "heart"; route: "my-lists" }
             Item { width: 1; height: 8 }
             SectionLabel { text: "List" }
+            component SidebarQueueRow: Rectangle {
+                id: queueDelegate
+                required property int rowIndex
+                required property var trackData
+                required property ListView ownerList
+                objectName: "sidebarQueueRow" + rowIndex
+                width: ownerList.width
+                x: 0
+                height: 52
+                radius: 12
+                color: rowIndex === shell.currentQueueIndex
+                       ? AppTheme.sidebarSelected
+                       : queueRowHover.hovered ? AppTheme.sidebarHover : "transparent"
+                border.width: rowIndex === shell.currentQueueIndex ? 1 / Screen.devicePixelRatio : 0
+                border.pixelAligned: false
+                border.color: shell.darkMode ? "#24ffffff" : "#50ffffff"
+                Behavior on color { ColorAnimation { duration: AppTheme.duration(100) } }
+                CoverArt {
+                    x: shell.sidebarCollapsed ? (queueDelegate.width - width) / 2 : 8
+                    Behavior on x { NumberAnimation { duration: AppTheme.duration(220); easing.type: Easing.InOutCubic } }
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 40
+                    height: width
+                    sourcePixelSize: 128
+                    cornerRadius: 9
+                    showShadow: false
+                    source: queueDelegate.trackData.artwork && queueDelegate.trackData.artwork.length
+                            ? queueDelegate.trackData.artwork : ""
+                }
+                Column {
+                    x: 56
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Math.max(0, parent.width - 92)
+                    spacing: 1
+                    opacity: shell.sidebarCollapsed ? 0 : 1
+                    visible: opacity > 0.001
+                    Behavior on opacity { NumberAnimation { duration: AppTheme.duration(140) } }
+                    Text { width: parent.width; text: queueDelegate.trackData.title; elide: Text.ElideRight; color: AppTheme.sidebarText; font.pixelSize: 12; font.weight: Font.DemiBold }
+                    Text { width: parent.width; text: queueDelegate.trackData.artist; elide: Text.ElideRight; color: AppTheme.sidebarSecondary; font.pixelSize: 10 }
+                }
+                HoverHandler { id: queueRowHover }
+                MouseArea {
+                    anchors.fill: parent
+                    acceptedButtons: Qt.LeftButton | Qt.RightButton
+                    onClicked: function(mouse) {
+                        if (mouse.button === Qt.RightButton) shell.removeQueue(queueDelegate.rowIndex)
+                        else shell.activateQueue(queueDelegate.rowIndex, queueDelegate.trackData)
+                    }
+                }
+                DragHandler {
+                    id: queueDrag
+                    target: null
+                    xAxis.enabled: false
+                    property real dragOffset: 0
+                    onActiveTranslationChanged: if (active) dragOffset = activeTranslation.y
+                    onActiveChanged: if (!active) {
+                        const offset = dragOffset
+                        dragOffset = 0
+                        if (Math.abs(offset) < 8) return
+                        const target = Math.max(0, Math.min(queueDelegate.ownerList.count - 1,
+                                                          Math.floor((queueDelegate.y + offset + queueDelegate.height / 2) / (queueDelegate.height + queueDelegate.ownerList.spacing))))
+                        if (target !== queueDelegate.rowIndex) shell.moveQueue(queueDelegate.rowIndex, target)
+                    }
+                }
+                transform: Translate { y: queueDrag.active ? queueDrag.dragOffset : 0 }
+                RoundIconButton {
+                    objectName: "sidebarQueueRemove" + queueDelegate.rowIndex
+                    anchors.right: parent.right
+                    anchors.rightMargin: 4
+                    anchors.verticalCenter: parent.verticalCenter
+                    diameter: 26
+                    kind: "close"
+                    glyphColor: AppTheme.sidebarSecondary
+                    transparentSurface: true
+                    visible: !shell.sidebarCollapsed
+                    opacity: queueRowHover.hovered ? 1 : 0
+                    enabled: opacity > 0.1
+                    Behavior on opacity { NumberAnimation { duration: AppTheme.duration(110) } }
+                    onClicked: shell.removeQueue(queueDelegate.rowIndex)
+                }
+            }
             ListView {
                 id: sidebarQueue
-                objectName: "sidebarQueue"
+                objectName: shell.useBackendModels && shell.playerController ? "" : "sidebarQueue"
+                visible: !(shell.useBackendModels && shell.playerController)
                 width: parent.width
                 height: Math.max(0, shell.height - sidebar.y - y - 12)
                 bottomMargin: floatingPlayer.visible ? floatingPlayer.height + 18 : 0
@@ -888,87 +978,35 @@ Item {
                 clip: true
                 interactive: contentHeight + bottomMargin > height
                 boundsBehavior: Flickable.StopAtBounds
-                model: shell.queueSongs
-                delegate: Rectangle {
-                    id: queueDelegate
-                    objectName: "sidebarQueueRow" + index
+                model: visible ? shell.queueSongs : []
+                delegate: SidebarQueueRow {
                     required property int index
                     required property var modelData
-                    width: sidebarQueue.width
-                    x: 0
-                    height: 52
-                    radius: 12
-                    color: index === shell.currentQueueIndex
-                           ? AppTheme.sidebarSelected
-                           : queueRowHover.hovered ? AppTheme.sidebarHover : "transparent"
-                    border.width: index === shell.currentQueueIndex ? 1 / Screen.devicePixelRatio : 0
-                    border.pixelAligned: false
-                    border.color: shell.darkMode ? "#24ffffff" : "#50ffffff"
-                    Behavior on color { ColorAnimation { duration: AppTheme.duration(100) } }
-                    CoverArt {
-                        x: shell.sidebarCollapsed ? (queueDelegate.width - width) / 2 : 8
-                        Behavior on x { NumberAnimation { duration: AppTheme.duration(220); easing.type: Easing.InOutCubic } }
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: 40
-                        height: width
-                        sourcePixelSize: 128
-                        cornerRadius: 9
-                        showShadow: false
-                        source: queueDelegate.modelData.artwork && queueDelegate.modelData.artwork.length
-                                ? queueDelegate.modelData.artwork
-                                : ""
-                    }
-                    Column {
-                        x: 56
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: Math.max(0, parent.width - 92)
-                        spacing: 1
-                        opacity: shell.sidebarCollapsed ? 0 : 1
-                        visible: opacity > 0.001
-                        Behavior on opacity { NumberAnimation { duration: AppTheme.duration(140) } }
-                        Text { width: parent.width; text: queueDelegate.modelData.title; elide: Text.ElideRight; color: AppTheme.sidebarText; font.pixelSize: 12; font.weight: Font.DemiBold }
-                        Text { width: parent.width; text: queueDelegate.modelData.artist; elide: Text.ElideRight; color: AppTheme.sidebarSecondary; font.pixelSize: 10 }
-                    }
-                    HoverHandler { id: queueRowHover }
-                    MouseArea {
-                        anchors.fill: parent
-                        acceptedButtons: Qt.LeftButton | Qt.RightButton
-                        onClicked: function(mouse) {
-                            if (mouse.button === Qt.RightButton) shell.removeQueue(queueDelegate.index)
-                            else shell.activateQueue(queueDelegate.index, queueDelegate.modelData)
-                        }
-                    }
-                    DragHandler {
-                        id: queueDrag
-                        target: null
-                        xAxis.enabled: false
-                        property real dragOffset: 0
-                        onActiveTranslationChanged: if (active) dragOffset = activeTranslation.y
-                        onActiveChanged: if (!active) {
-                            const offset = dragOffset
-                            dragOffset = 0
-                            if (Math.abs(offset) < 8) return
-                            const target = Math.max(0, Math.min(shell.queueSongs.length - 1,
-                                                              Math.floor((queueDelegate.y + offset + queueDelegate.height / 2) / (queueDelegate.height + sidebarQueue.spacing))))
-                            if (target !== queueDelegate.index) shell.moveQueue(queueDelegate.index, target)
-                        }
-                    }
-                    transform: Translate { y: queueDrag.active ? queueDrag.dragOffset : 0 }
-                    RoundIconButton {
-                        objectName: "sidebarQueueRemove" + queueDelegate.index
-                        anchors.right: parent.right
-                        anchors.rightMargin: 4
-                        anchors.verticalCenter: parent.verticalCenter
-                        diameter: 26
-                        kind: "close"
-                        glyphColor: AppTheme.sidebarSecondary
-                        transparentSurface: true
-                        visible: !shell.sidebarCollapsed
-                        opacity: queueRowHover.hovered ? 1 : 0
-                        enabled: opacity > 0.1
-                        Behavior on opacity { NumberAnimation { duration: AppTheme.duration(110) } }
-                        onClicked: shell.removeQueue(queueDelegate.index)
-                    }
+                    rowIndex: index
+                    trackData: modelData
+                    ownerList: sidebarQueue
+                }
+            }
+            ListView {
+                id: sidebarBackendQueue
+                objectName: shell.useBackendModels && shell.playerController ? "sidebarQueue" : ""
+                visible: shell.useBackendModels && !!shell.playerController
+                width: parent.width
+                height: Math.max(0, shell.height - sidebar.y - y - 12)
+                bottomMargin: floatingPlayer.visible ? floatingPlayer.height + 18 : 0
+                spacing: 6
+                clip: true
+                interactive: contentHeight + bottomMargin > height
+                boundsBehavior: Flickable.StopAtBounds
+                model: visible ? shell.playerController.queueModel : null
+                delegate: SidebarQueueRow {
+                    required property int index
+                    required property string title
+                    required property string artist
+                    required property string artwork
+                    rowIndex: index
+                    trackData: ({ title: title, artist: artist, artwork: artwork })
+                    ownerList: sidebarBackendQueue
                 }
             }
         }
@@ -1034,7 +1072,7 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 10
                 TopGlyph { objectName: "topDownloadButton"; selected: shell.downloadsOpen; kind: "download"; visible: { const r = shell.settingsController ? shell.settingsController.revision : 0; return shell.settingsController ? shell.settingsController.value("download.enabled", true) : false } onClicked: shell.downloadsOpen = !shell.downloadsOpen }
-                TopGlyph { objectName: "topThemeButton"; selected: shell.darkMode; kind: shell.darkMode ? "moon" : "sun"; onClicked: shell.toggleTheme() }
+                TopGlyph { objectName: "topThemeButton"; kind: shell.darkMode ? "moon" : "sun"; onClicked: shell.toggleTheme() }
                 TopGlyph { objectName: "topSettingsButton"; selected: shell.settingsOpen; kind: "gear"; onClicked: shell.settingsOpen = !shell.settingsOpen }
                 Row {
                     id: topTrafficCluster
@@ -1431,8 +1469,10 @@ Item {
                     shell.currentRoute = shell.previousRoute || "library/albums"
                     shell.routeChanged(shell.currentRoute)
                 }
-                shell.collectionMorphActive = !shell.collectionMorphClosing && detailLoader.status !== Loader.Ready
+                shell.collectionMorphActive = !shell.collectionMorphClosing
+                    && shell.currentRoute.indexOf("detail/") === 0 && detailLoader.status !== Loader.Ready
                 shell.collectionMorphClosing = false
+                shell.releaseInactiveCollectionRows()
             }
         }
 
@@ -1487,7 +1527,7 @@ Item {
                 width: shell.queueFromNowPlaying ? Math.min(520, parent.width) : 390
                 height: shell.queueFromNowPlaying ? parent.height : parent.height - 58
                 opacity: .82 + .18 * shell.queueProgress
-                rows: shell.queueFromImmersive ? [] : shell.queueSongs
+                rows: shell.queueFromImmersive || sourceModel ? [] : shell.queueSongs
                 darkMode: shell.darkMode
                 fullScreenPresentation: shell.queueFromNowPlaying
                 currentIndex: shell.currentQueueIndex
@@ -1510,7 +1550,7 @@ Item {
                 sourceComponent: ImmersiveDiscQueue {
                     open: shell.queueOpen
                     reducedMotion: !shell.animationsEnabled || !!shell.captureView.length
-                    rows: shell.queueSongs
+                    rows: sourceModel ? [] : shell.queueSongs
                     sourceModel: shell.useBackendModels && shell.playerController ? shell.playerController.queueModel : null
                     currentIndex: shell.currentQueueIndex
                     playing: shell.playing
@@ -1685,9 +1725,9 @@ Item {
                 libraryPage.commitPreparedCollection()
             }
             onOpenCollection: function(kind, title, tint) { shell.openCollection(kind, title, tint) }
-            onTrackActivated: function(track) { shell.playTrack(track) }
-            onTrackCommandRequested: function(command, track, rowIndex) {
-                shell.handleTrackCommand(command, track, rowIndex)
+            onTrackActivated: function(track, playbackContext) { shell.playTrack(track, playbackContext) }
+            onTrackCommandRequested: function(command, track, rowIndex, playbackContext) {
+                shell.handleTrackCommand(command, track, rowIndex, playbackContext)
             }
             onTrackSortRequested: function(column, order) { shell.requestTrackSort(column, order) }
         }
@@ -1719,14 +1759,45 @@ Item {
             Behavior on x { NumberAnimation { duration: AppTheme.duration(240); easing.type: Easing.OutCubic } }
         }
     }
+    ContextMenu {
+        id: nowPlayingFavoriteMenu
+        objectName: "nowPlayingFavoriteMenu"
+        anchors.fill: parent
+        z: 150
+        menuWidth: 244
+        actions: {
+            const entries = [{ label: qsTr("收藏到“我的收藏”"), enabled: false }]
+            for (let i = 0; i < shell.editablePlaylists.length; ++i) {
+                const list = shell.editablePlaylists[i]
+                entries.push({ label: list.title, command: "list:" + list.id,
+                               separatorBefore: i === 0 })
+            }
+            entries.push({ label: qsTr("新建歌单…"), command: "create", separatorBefore: true })
+            return entries
+        }
+        onCommandTriggered: function(command, track) {
+            if (!shell.playlistController || !track) return
+            if (command === "create") {
+                shell.pendingPlaylistTracks = [track]
+                shell.addPlaylistCreateOnly = true
+                Qt.callLater(function() { shell.addPlaylistOpen = true })
+            } else if (command.indexOf("list:") === 0) {
+                shell.playlistController.addTracks(command.substring(5), [track])
+            }
+        }
+    }
     AlertDialog {
         anchors.fill: parent
         z: 150
         open: shell.addPlaylistOpen
-        title: qsTr("添加到歌单")
-        message: qsTr("选择歌单，或输入名称新建")
-        primaryLabel: qsTr("添加")
+        title: shell.addPlaylistCreateOnly ? qsTr("新建收藏歌单") : qsTr("添加到歌单")
+        message: shell.addPlaylistCreateOnly ? qsTr("输入名称，将当前歌曲收藏到新歌单") : qsTr("选择歌单，或输入名称新建")
+        primaryLabel: shell.addPlaylistCreateOnly ? qsTr("新建并收藏") : qsTr("添加")
         secondaryLabel: qsTr("取消")
+        onOpenChanged: if (open && contentItem) {
+            contentItem.newName = ""
+            contentItem.targetId = ""
+        }
         contentComponent: Component {
             Column {
                 property string targetId: ""
@@ -1734,6 +1805,7 @@ Item {
                 spacing: 10
                 SettingsSelect {
                     width: parent.width
+                    visible: !shell.addPlaylistCreateOnly
                     options: shell.editablePlaylists.map(function(p) { return {label:p.title,value:p.id} })
                     onValueSelected: function(value, index) { parent.targetId = value }
                 }
@@ -1747,7 +1819,10 @@ Item {
         }
         onRejected: shell.addPlaylistOpen = false
         onAccepted: {
-            if (contentItem.newName.trim().length) shell.playlistController.create(contentItem.newName, shell.pendingPlaylistTracks)
+            if (contentItem.newName.trim().length) {
+                if (!shell.playlistController.create(contentItem.newName.trim(), shell.pendingPlaylistTracks).length) return
+            }
+            else if (shell.addPlaylistCreateOnly) return
             else {
                 const id = contentItem.targetId || (shell.editablePlaylists.length ? shell.editablePlaylists[0].id : "")
                 if (!id.length) return
@@ -1770,15 +1845,15 @@ Item {
                 shell.prepareCollectionMorph(kind, title, tint, frameRect, artworkRect, artworkSource, artworkItem)
                 shell.openCollection(kind, title, tint)
             }
-            onTrackActivated: track => shell.playTrack(track)
+            onTrackActivated: (track, playbackContext) => shell.playTrack(track, playbackContext)
             onPodcastRequested: podcast => {
                 shell.radioReturnToFavorites=true
                 shell.radioController.openPodcast(podcast)
                 shell.currentRoute="radio"
                 shell.routeChanged("radio")
             }
-            onTrackCommandRequested: function(command, track, rowIndex) {
-                shell.handleTrackCommand(command, track, rowIndex)
+            onTrackCommandRequested: function(command, track, rowIndex, playbackContext) {
+                shell.handleTrackCommand(command, track, rowIndex, playbackContext)
             }
             onTrackSortRequested: function(column, order) { shell.requestTrackSort(column, order) }
             onCreateRequested: function(name) { shell.playlistController.create(name) }
@@ -1801,8 +1876,8 @@ Item {
                 shell.prepareCollectionMorph("Playlist", collection.title, collection.color || "#80868d", frameRect, artworkRect, artworkSource, artworkItem)
                 shell.openOnlineCollection(collection)
             }
-            onTrackActivated: track => shell.playTrack(track)
-            onTrackCommandRequested: (command,track,rowIndex) => shell.handleTrackCommand(command,track,rowIndex)
+            onTrackActivated: (track, playbackContext) => shell.playTrack(track, playbackContext)
+            onTrackCommandRequested: (command,track,rowIndex,playbackContext) => shell.handleTrackCommand(command,track,rowIndex,playbackContext)
 
         }
     }
@@ -1837,7 +1912,7 @@ Item {
             backdrop: globalBackground
             darkMode: shell.darkMode
             filterText: shell.filterForRoute("radio")
-            onTrackActivated: track => shell.playTrack(track)
+            onTrackActivated: (track, playbackContext) => shell.playTrack(track, playbackContext)
             onPodcastOpened: shell.radioReturnToFavorites=false
             onPodcastClosed: {
                 if(shell.radioReturnToFavorites) {
@@ -1857,11 +1932,11 @@ Item {
             query: shell.searchQuery
             onlineController: shell.onlineController
             darkMode: shell.darkMode
-            onTrackActivated: {
-                shell.playTrack(track)
+            onTrackActivated: (track, playbackContext) => {
+                shell.playTrack(track, playbackContext)
             }
-            onTrackCommandRequested: function(command, track, rowIndex) {
-                shell.handleTrackCommand(command, track, rowIndex)
+            onTrackCommandRequested: function(command, track, rowIndex, playbackContext) {
+                shell.handleTrackCommand(command, track, rowIndex, playbackContext)
             }
             onTrackSortRequested: function(column, order) { shell.requestTrackSort(column, order) }
             onCollectionActivated: collection => shell.openOnlineCollection(collection)
@@ -1890,14 +1965,14 @@ Item {
             onPlayAllRequested: shell.playerController.playAll(rows)
             onShuffleAllRequested: { shell.playerController.setPlaybackMode("shuffle"); shell.playerController.playAll(rows) }
             editablePlaylist: kind === "Playlist" && shell.playlistController.detail.kind === "Local" && !shell.playlistController.detail.reference
-            onTrackActivated: shell.playTrack(track)
-            onTrackCommandRequested: function(command, track, rowIndex) {
+            onTrackActivated: (track, playbackContext) => shell.playTrack(track, playbackContext)
+            onTrackCommandRequested: function(command, track, rowIndex, playbackContext) {
                 if (command === "remove_from_playlist" && editablePlaylist) {
                     const detail=shell.playlistController.detail
                     const key=t => t.localPath ? t.localPath.replace(/\\/g,"/").toLowerCase() : t.source+":"+t.rid
                     const index=(detail.tracks || []).findIndex(t => key(t)===key(track))
                     if(index>=0) { shell.playlistController.removeTrack(detail.id,index); shell.playlistController.openTitle(shell.selectedCollectionTitle) }
-                } else shell.handleTrackCommand(command, track, rowIndex)
+                } else shell.handleTrackCommand(command, track, rowIndex, playbackContext)
             }
             onTrackSortRequested: function(column, order) { shell.requestTrackSort(column, order) }
             albumYear: kind === "Album" && rows.length ? shell.playerController.albumYear(rows[0].localPath || "") : ""
@@ -1989,6 +2064,11 @@ Item {
             onEqualizerRequested: equalizerPopup.open()
             onInformationRequested: shell.openMusicEditor(shell.displayedTrack)
             onDownloadRequested: shell.chooseDownload([shell.displayedTrack])
+            onFavoriteRequested: function(anchorItem) {
+                if (!shell.playlistController) return
+                const point = anchorItem.mapToItem(shell, 0, anchorItem.height)
+                nowPlayingFavoriteMenu.openAt(point.x, point.y, shell.displayedTrack)
+            }
             onLyricsMatchRequested: lyricsMatchPopup.match(shell.displayedTrack, false)
             settingsStore: shell.settingsController
             neteaseComments: !!shell.playerController.currentTrack.localPath || shell.playerController.currentTrack.source === "wy"

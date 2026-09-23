@@ -6,6 +6,10 @@
 #include <QJsonDocument>
 #include <QBuffer>
 #include <QImageReader>
+#include <QHash>
+#include <QReadWriteLock>
+#include <QStringList>
+#include <memory>
 #include <qmmp/metadatamanager.h>
 #include <taglib/fileref.h>
 #include <taglib/flacfile.h>
@@ -17,6 +21,31 @@
 
 // TagLib handles embedded MP3/FLAC pictures; Qmmp locates adjacent covers.
 // Qt Quick owns the asynchronous request thread and caches size variants.
+class CollectionCoverIndex final {
+public:
+    using Candidates = QHash<QString, QStringList>;
+
+    // The catalog publishes a complete generation before announcing its rows.
+    // Returning the old generation lets the caller retire it off the GUI thread.
+    Candidates replace(Candidates&& next) {
+        QWriteLocker locker(&lock_);
+        candidates_.swap(next);
+        return std::move(next);
+    }
+
+    QStringList candidates(const QString& id) const {
+        QReadLocker locker(&lock_);
+        // Resolve old URLs for a surviving group against its latest members.
+        // The new content version still forces Qt's image cache to refresh.
+        // QStringList is implicitly shared. File I/O happens after unlocking.
+        return candidates_.value(id.section('/', 0, 1));
+    }
+
+private:
+    mutable QReadWriteLock lock_;
+    Candidates candidates_;
+};
+
 class CoverImageProvider final : public QQuickImageProvider {
     static QImage readScaled(QImageReader& reader, const QSize& bounds) {
         const auto original = reader.size();
@@ -56,7 +85,9 @@ class CoverImageProvider final : public QQuickImageProvider {
         return image;
     }
 public:
-    CoverImageProvider() : QQuickImageProvider(QQuickImageProvider::Texture, QQmlImageProviderBase::ForceAsynchronousImageLoading) {}
+    explicit CoverImageProvider(std::shared_ptr<CollectionCoverIndex> index = {})
+        : QQuickImageProvider(QQuickImageProvider::Texture, QQmlImageProviderBase::ForceAsynchronousImageLoading),
+          index_(std::move(index)) {}
     QQuickTextureFactory* requestTexture(const QString& id, QSize* size, const QSize& requested) override {
         return new ArtworkTextureFactory(requestImage(id, size, requested));
     }
@@ -68,7 +99,13 @@ public:
             ? QSize(requested.width() > 0 ? qMin(requested.width(), 2400) : 2400,
                     requested.height() > 0 ? qMin(requested.height(), 2400) : 2400)
             : QSize(256, 256);
-        if (id.startsWith("collection/")) {
+        if (id.startsWith("collection-index/")) {
+            const auto candidates = index_ ? index_->candidates(id) : QStringList{};
+            for (const auto& candidate : candidates) {
+                image = loadArtwork(candidate.mid(15), bounds);
+                if (!image.isNull()) break;
+            }
+        } else if (id.startsWith("collection/")) {
             const auto encoded = id.section('?', 0, 0).mid(11).toLatin1();
             const auto candidates = QJsonDocument::fromJson(QByteArray::fromBase64(encoded, QByteArray::Base64UrlEncoding)).array();
             for (const auto& candidate : candidates) {
@@ -84,4 +121,6 @@ public:
         if (size) *size = image.size();
         return image;
     }
+private:
+    std::shared_ptr<CollectionCoverIndex> index_;
 };

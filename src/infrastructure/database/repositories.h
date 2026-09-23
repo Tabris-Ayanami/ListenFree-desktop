@@ -12,6 +12,7 @@ public:
     bool upsert(std::span<const domain::Track> tracks) override;
     std::optional<domain::Track> find(const domain::TrackId& id) override;
     std::vector<domain::Track> search(const std::string& query) override;
+    std::uint64_t count() override;
     std::vector<application::LocalFileFingerprint> localFiles() override;
 
 private:

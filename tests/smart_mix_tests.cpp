@@ -323,6 +323,100 @@ private slots:
         player.next();QVERIFY(player.mixing());QTRY_COMPARE_WITH_TIMEOUT(player.currentTrack().value("localPath"),current,6000);
         player.stop();
     }
+    void delayedResolvedOnlinePreload_data() {
+        QTest::addColumn<bool>("earlyResolution");
+        QTest::addColumn<bool>("natural");
+        QTest::newRow("manual-next") << false << false;
+        QTest::newRow("early-url-only") << true << false;
+        QTest::newRow("natural-next") << true << true;
+    }
+    void delayedResolvedOnlinePreload() {
+        QFETCH(bool,earlyResolution);
+        QFETCH(bool,natural);
+        const auto capture=temp.filePath(QString("delayed-resolve-%1.pcm").arg(QTest::currentDataTag()));
+        qputenv("LISTENFREE_TEST_PCM",capture.toUtf8());
+        const auto a=makeWave("delayed-resolve-a.wav",0,44100,35);
+        const auto b=makeWave("delayed-resolve-b.wav",1,44100,20);
+        QFile mediaFile(b);QVERIFY(mediaFile.open(QIODevice::ReadOnly));
+        const auto media=mediaFile.readAll();
+        QTcpServer server;QVERIFY(server.listen(QHostAddress::LocalHost));
+        int resolves=0,mediaRequests=0;
+        connect(&server,&QTcpServer::newConnection,this,[&] {
+            while (auto* socket=server.nextPendingConnection()) {
+                connect(socket,&QTcpSocket::disconnected,socket,&QObject::deleteLater);
+                connect(socket,&QTcpSocket::readyRead,socket,[&,socket] {
+                    auto request=socket->property("request").toByteArray()+socket->readAll();
+                    socket->setProperty("request",request);
+                    if (!request.contains("\r\n\r\n") || socket->property("sent").toBool()) return;
+                    socket->setProperty("sent",true);
+                    if (request.startsWith("GET /resolve")) {
+                        ++resolves;
+                        QTimer::singleShot(700,socket,[socket] {
+                            socket->write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+                            socket->disconnectFromHost();
+                        });
+                        return;
+                    }
+                    ++mediaRequests;
+                    const auto marker=request.toLower().indexOf("range: bytes=");
+                    const auto offset=marker>=0 ? request.mid(marker+13).split('-').first().toLongLong() : 0;
+                    const auto start=std::clamp<qint64>(offset,0,media.size());
+                    QByteArray header=start>0 ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n";
+                    header+="Content-Type: audio/wav\r\nAccept-Ranges: bytes\r\nContent-Length: "+QByteArray::number(media.size()-start)+"\r\n";
+                    if (start>0) header+="Content-Range: bytes "+QByteArray::number(start)+"-"+
+                        QByteArray::number(media.size()-1)+"/"+QByteArray::number(media.size())+"\r\n";
+                    socket->write(header+"Connection: close\r\n\r\n"+media.mid(start));
+                    socket->disconnectFromHost();
+                });
+            }
+        });
+        infrastructure::database::Database db;
+        const auto path=temp.filePath(QString("delayed-resolve-%1.sqlite").arg(QTest::currentDataTag()));
+        QVERIFY(db.open(path));QVERIFY(db.migrate());
+        db.setSetting("playback.transition.smart","true");db.setSetting("playback.quality","128k");
+        db.setSetting("playback.skipOnError","false");
+        infrastructure::database::SettingsRepository repo(db);
+        qmlbridge::SourceController source(&repo,QCoreApplication::applicationDirPath()+"/listenfree-sourcehost.exe",true);
+        QTRY_VERIFY_WITH_TIMEOUT(source.hostReady(),10000);
+        QFile script(temp.filePath("delayed-resolve-source.js"));QVERIFY(script.open(QIODevice::WriteOnly));
+        script.write(QString("lx.on(lx.EVENT_NAMES.request, () => new Promise((resolve,reject) => lx.request('http://127.0.0.1:%1/resolve', {}, err => err ? reject(err) : resolve('http://127.0.0.1:%1/media.wav'))));lx.send(lx.EVENT_NAMES.inited,{status:true,sources:{kw:{type:'music',actions:['musicUrl'],qualitys:['128k']}}});")
+            .arg(server.serverPort()).toUtf8());
+        script.close();QVERIFY(source.importLocalFile(script.fileName()));
+        QTRY_VERIFY_WITH_TIMEOUT(source.sources().last().toMap().value("hostReady").toBool(),10000);
+        qmlbridge::PortableSession player(db,path,source);
+        auto online=track(b);online.remove("localPath");
+        online["trackId"]="resolved-online";online["source"]="kw";online["rid"]="resolved-online";
+        QSignalSpy committed(&player,&qmlbridge::PortableSession::smartMixCommitted);
+        player.playAll({track(a),online});
+        QTRY_VERIFY_WITH_TIMEOUT(player.state()=="Playing" && player.position()>300,5000);
+        if (earlyResolution) {
+            player.seek(natural?20000:12000);
+            QTRY_VERIFY_WITH_TIMEOUT(player.position()>=(natural?19500:11500),3000);
+            QTRY_VERIFY_WITH_TIMEOUT(resolves==1,3000);
+            QTest::qWait(900);
+            QCOMPARE(mediaRequests,0); // A URL can be cached without allocating the B decoder/buffer.
+        }
+        if (!natural) {
+            player.next();
+            QVERIFY(player.mixing());
+            QTest::qWait(500);
+            QCOMPARE(player.currentQueueIndex(),0); // 350 ms was too short for the 700 ms resolver.
+        }
+        QTRY_COMPARE_WITH_TIMEOUT(player.currentQueueIndex(),1,natural?16000:8000);
+        QCOMPARE(committed.size(),1);
+        QVERIFY(committed.first().first().toBool());
+        QVERIFY(player.duration()>0);
+        QVERIFY(mediaRequests>0);
+        QTRY_VERIFY_WITH_TIMEOUT(player.position()>4500,7000);
+        player.stop();
+        QFile captured(capture);QVERIFY(captured.open(QIODevice::ReadOnly));
+        const auto pcm=captured.readAll();
+        int overlap=0;
+        for (qsizetype i=0;i+3<pcm.size();i+=4)
+            if (std::abs(qFromLittleEndian<qint16>(pcm.constData()+i))>500 &&
+                std::abs(qFromLittleEndian<qint16>(pcm.constData()+i+2))>500) ++overlap;
+        QVERIFY2(overlap>44100/2,"Resolved online B must audibly overlap local A");
+    }
     void manualCancellation() {
         const auto a=makeWave("manual-a.wav",0),b=makeWave("manual-b.wav",1),c=makeWave("manual-c.wav",0);
         qputenv("LISTENFREE_TEST_PCM",temp.filePath("manual.pcm").toUtf8());

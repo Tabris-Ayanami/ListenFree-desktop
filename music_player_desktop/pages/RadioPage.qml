@@ -16,7 +16,7 @@ Item {
         stationList.forceLayout()
         stationList.contentY = Math.max(0, Math.min(state.y, stationList.contentHeight - stationList.height + stationList.bottomMargin))
     }
-    signal trackActivated(var track)
+    signal trackActivated(var track, var playbackContext)
     signal podcastOpened()
     signal podcastClosed()
     readonly property bool programs: service && Object.keys(service.podcast).length > 0
@@ -148,8 +148,8 @@ Item {
                 SongRow {
                     track: cell.modelData; rowIndex: cell.index; canvasText: true
                     playerController: page.playerController; showDownload: false
-                    onActivated: page.trackActivated(track)
-                    onSelectedRequested: page.trackActivated(track)
+                    onActivated: page.trackActivated(track, page.service ? page.service.rows : [])
+                    onSelectedRequested: page.trackActivated(track, page.service ? page.service.rows : [])
                     onCommandRequested: command => {
                         if(command==="favorite")page.service.toggleFavorite(track)
                         else if(command==="play_next")page.playerController.enqueueTrack(track,true)
@@ -172,7 +172,7 @@ Item {
                         return page.service.isFavorite(cell.modelData)
                     }
                     radius: 14; color: current ? AppTheme.canvasSelected : cardMouse.containsMouse ? AppTheme.canvasHover : Qt.rgba(AppTheme.canvasText.r,AppTheme.canvasText.g,AppTheme.canvasText.b,.035)
-                    MouseArea { id: cardMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { if(cell.modelData.kind==="podcast"){page.podcastOpened();page.service.openPodcast(cell.modelData)}else page.trackActivated(cell.modelData) } }
+                    MouseArea { id: cardMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { if(cell.modelData.kind==="podcast"){page.podcastOpened();page.service.openPodcast(cell.modelData)}else page.trackActivated(cell.modelData, page.service ? page.service.rows : []) } }
                     CoverArt { x: 10; anchors.verticalCenter: parent.verticalCenter; width: 64; height: 64; cornerRadius: 10; artworkTier: "Thumbnail"; source: cell.modelData.artwork || "" }
                     Column {
                         x: 86; width: Math.max(30,parent.width-x-48); anchors.verticalCenter: parent.verticalCenter; spacing: 6

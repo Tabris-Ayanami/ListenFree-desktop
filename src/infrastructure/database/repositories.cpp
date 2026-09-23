@@ -19,6 +19,10 @@ std::vector<domain::Track> TrackRepository::search(const std::string& query) {
     return database_.searchTracks(QString::fromStdString(query));
 }
 
+std::uint64_t TrackRepository::count() {
+    return database_.trackCount();
+}
+
 std::vector<application::LocalFileFingerprint> TrackRepository::localFiles() {
     return database_.loadLocalFiles();
 }

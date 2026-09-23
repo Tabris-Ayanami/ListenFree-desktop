@@ -7,6 +7,8 @@
 #include <QString>
 #include <QStringList>
 #include <QVariantList>
+#include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -31,6 +33,25 @@ struct UpsertStatements {
     explicit UpsertStatements(QSqlDatabase& database);
 };
 
+struct CatalogSnapshotState {
+    std::int64_t revision = 0;
+    std::int64_t resetRevision = 0;
+};
+
+struct CatalogTrackChange {
+    std::string trackId;
+    // An absent track is a committed deletion, not a query failure.
+    std::optional<domain::Track> track;
+};
+
+struct CatalogDelta {
+    CatalogSnapshotState state;
+    bool requiresFullReload = false;
+    std::vector<CatalogTrackChange> changes;
+};
+
+struct CatalogJournal;
+
 class Database final {
 public:
     Database() = default;
@@ -53,7 +74,19 @@ public:
     bool restoreMissingRelations(std::span<const domain::Track> tracks);
     [[nodiscard]] std::optional<domain::Track> findTrack(const domain::TrackId& id) const;
     [[nodiscard]] std::vector<domain::Track> searchTracks(const QString& queryText) const;
+    [[nodiscard]] std::uint64_t trackCount() const;
     [[nodiscard]] std::vector<domain::Track> loadTracks() const;
+    // Visits tracks in loadTracks() order while keeping only one hydrated track
+    // in application memory. The callback must not change this connection.
+    [[nodiscard]] bool forEachTrack(const std::function<void(domain::Track&&)>& callback) const;
+    // State and rows come from one SQLite read snapshot. A false result means
+    // the transaction or a query failed; callers must discard partial rows.
+    [[nodiscard]] bool forEachTrackWithRevision(
+        const std::function<void(domain::Track&&)>& callback, CatalogSnapshotState& out) const;
+    // maxChanges bounds both the journal scan and hydration. A missing track
+    // appears as a change with nullopt; SQL failures return false.
+    [[nodiscard]] bool readCatalogDelta(std::int64_t afterRevision, std::size_t maxChanges,
+                                        CatalogDelta& out) const;
     [[nodiscard]] std::vector<application::LocalFileFingerprint> loadLocalFiles() const;
     [[nodiscard]] QVariantList loadLibraryFolders() const;
     bool addLibraryFolder(const QString& path);
@@ -76,8 +109,8 @@ public:
 
 private:
     bool connect(const QString& path);
-    bool upsertTrackRows(const domain::Track& track);
-    bool upsertTrackRows(const domain::Track& track, UpsertStatements& statements);
+    bool upsertTrackRows(const domain::Track& track, UpsertStatements& statements,
+                         CatalogJournal& journal);
 
     QSqlDatabase db_;
     QString connectionName_;

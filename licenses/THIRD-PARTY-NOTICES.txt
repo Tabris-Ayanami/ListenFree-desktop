@@ -1,4 +1,4 @@
-ListenFree 0.3.4 第三方组件与修改说明
+ListenFree 0.3.5 第三方组件与修改说明
 
 Qt 6.11.2：Core、Gui、Widgets、Quick/QML、Network、Sql、Concurrent、Multimedia 和 ShaderTools。
 Qt Multimedia 的 Windows MMCSS 修复见 patches/qt/6.11.2。

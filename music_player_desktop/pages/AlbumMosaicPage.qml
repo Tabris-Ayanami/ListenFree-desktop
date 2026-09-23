@@ -28,8 +28,8 @@ Item {
     }
     readonly property var selectedTracks: !selectedAlbum || !catalog ? [] : (catalog.songs || []).filter(
         song => (song.album || qsTr("未知专辑")) === selectedAlbum.title && (song.artist || "") === (selectedAlbum.artist || ""))
-    signal trackActivated(var track)
-    signal trackCommandRequested(string command, var track, int rowIndex)
+    signal trackActivated(var track, var playbackContext)
+    signal trackCommandRequested(string command, var track, int rowIndex, var playbackContext)
     signal playAllRequested(var tracks)
 
     onFilterTextChanged: { closeAlbum(); panX=0; panY=0 }
@@ -220,8 +220,8 @@ Item {
                     // All rows in this window share the album thumbnail/cache.
                     artworkSource: page.selectedAlbum ? page.selectedAlbum.artwork || "" : ""
                     fallbackArtwork: page.selectedAlbum ? page.selectedAlbum.artwork || "" : ""
-                    onActivated: page.trackActivated(track)
-                    onCommandRequested: command => page.trackCommandRequested(command,track,index)
+                    onActivated: page.trackActivated(track, page.selectedTracks)
+                    onCommandRequested: command => page.trackCommandRequested(command,track,index,page.selectedTracks)
                     onContextRequested: (mx,my) => { const p=mapToItem(page,mx,my); songMenu.openAt(p.x,p.y,{track:track,rowIndex:index}) }
                 }
                 WheelHandler {
@@ -240,7 +240,7 @@ Item {
         id: songMenu
         objectName: "mosaicSongContextMenu"
         anchors.fill: parent; z: 5
-        onCommandTriggered: (command,data) => page.trackCommandRequested(command,data.track,data.rowIndex)
+        onCommandTriggered: (command,data) => page.trackCommandRequested(command,data.track,data.rowIndex,page.selectedTracks)
     }
     Column {
         visible: page.albums.length===0

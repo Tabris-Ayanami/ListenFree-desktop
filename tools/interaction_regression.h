@@ -5,6 +5,8 @@
 #pragma once
 #include "qmlbridge/portable_session.h"
 #include <QApplication>
+#include <QDataStream>
+#include <QDir>
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -31,13 +33,34 @@ inline QQuickItem* uiItem(QQuickItem* root, const QString& name) {
     for (auto* child : root->childItems()) if (auto* found = uiItem(child, name)) return found;
     return nullptr;
 }
+inline QQuickItem* uiSongRowForPath(QQuickItem* root, const QString& path) {
+    if (!root) return nullptr;
+    if (root->objectName() == "songRow") {
+        const auto value = root->property("track");
+        const auto track = value.canConvert<QJSValue>() ? value.value<QJSValue>().toVariant().toMap() : value.toMap();
+        if (track.value("localPath").toString() == path) return root;
+    }
+    for (auto* child : root->childItems()) if (auto* found = uiSongRowForPath(child, path)) return found;
+    return nullptr;
+}
+inline void uiCollectLibraryPages(QQuickItem* root, QList<QQuickItem*>& pages) {
+    if (!root) return;
+    if (root->objectName() == QStringLiteral("libraryPage")) pages.append(root);
+    for (auto* child : root->childItems()) uiCollectLibraryPages(child, pages);
+}
+inline qsizetype uiQmlListSize(const QVariant& value) {
+    return value.canConvert<QJSValue>() ? value.value<QJSValue>().toVariant().toList().size()
+                                        : value.toList().size();
+}
 inline void runUiRegression(QApplication& app, QQuickWindow* window, QObject* shell,
                             listenfree::qmlbridge::PortableSession& player, listenfree::qmlbridge::SettingsController& settings, listenfree::qmlbridge::CollectionService& collections, listenfree::qmlbridge::SourceController& sources, const QString& report) {
-    struct State { int phase=0, ticks=0; QString listId; qsizetype count=0; double flowTime=0; QImage background; QJsonObject checks, measures; QPointer<QQuickItem> pressed; QPointer<UiInputProbe> probe; qint64 pausedPosition=0; QPointF point; QVariantMap song; };
+    struct State { int phase=0, ticks=0, detailWait=0, themeWait=0; QString listId; qsizetype count=0; double flowTime=0; QImage background; QJsonObject checks, measures; QPointer<QQuickItem> pressed; QPointer<UiInputProbe> probe; qint64 pausedPosition=0; QPointF point; QVariantMap song; QVariantList fixtureRows; };
     auto state=std::make_shared<State>();
     if (app.arguments().contains("--check-next")) state->phase=-3;
     if (app.arguments().contains("--check-shortcuts")) state->phase=100;
     if (app.arguments().contains("--check-collection-scroll-theme")) state->phase=200;
+    if (app.arguments().contains("--check-play-action")) state->phase=300;
+    if (app.arguments().contains("--check-library-sections")) state->phase=400;
     auto* timer=new QTimer(&app); timer->setInterval(350);
     const auto item=[window](const QString& name) { return uiItem(window->contentItem(), name); };
     const auto mouse=[window](QEvent::Type type, QPointF point, Qt::MouseButton button, Qt::MouseButtons buttons) {
@@ -50,6 +73,267 @@ inline void runUiRegression(QApplication& app, QQuickWindow* window, QObject* sh
         { QFile progress(report); if(progress.open(QIODevice::WriteOnly)) { auto data=state->checks; data["measurements"]=state->measures; progress.write(QJsonDocument(data).toJson()); } }
         if (++state->ticks>400) { app.exit(8); return; }
         switch(state->phase++) {
+        case 400: {
+            if (!player.ready() && ++state->count<200) { --state->phase; return; }
+            state->checks["library_catalog_ready"]=player.ready();
+            if (!player.ready()) { state->phase=405; return; }
+            state->measures["expected_songs"]=player.songs().size();
+            state->measures["expected_albums"]=player.albums().size();
+            state->measures["expected_artists"]=player.artists().size();
+            state->checks["library_backend_song_model_matches_catalog"]=
+                player.tracksModel()->rowCount()==player.songs().size();
+            window->resize(1066,709);window->show();
+            settings.setValue("ui.animations",false);
+            shell->setProperty("settingsOpen",false);
+            shell->setProperty("nowPlayingOpen",false);
+            shell->setProperty("albumLayoutMode",QStringLiteral("Flow"));
+            shell->setProperty("navigationFilters",QVariantMap{});
+            shell->setProperty("pageSearchQuery",QString{});
+            shell->setProperty("currentRoute",QStringLiteral("library/songs"));
+            state->count=0;
+            return;
+        }
+        case 401: case 402: case 403: case 404: {
+            const int currentPhase=state->phase-1;
+            const auto route=currentPhase==402 ? QStringLiteral("library/albums")
+                            : currentPhase==403 ? QStringLiteral("library/artists")
+                                                : QStringLiteral("library/songs");
+            const auto section=route.section('/',1);
+            const auto sectionProperty=section.toUtf8();
+            auto* cache=item("navigationStateCache");
+            QList<QQuickItem*> pages;
+            uiCollectLibraryPages(window->contentItem(),pages);
+            QQuickItem* active=nullptr;
+            int visibleCount=0, cachedCount=0;
+            bool cachedCollectionsEmpty=true;
+            for (auto* page:pages) {
+                bool visible=true;
+                for (auto* ancestor=page;ancestor;ancestor=ancestor->parentItem())
+                    visible &= ancestor->isVisible();
+                if (visible) { ++visibleCount; active=page; }
+                else {
+                    ++cachedCount;
+                    cachedCollectionsEmpty &= uiQmlListSize(page->property("albums"))==0
+                        && uiQmlListSize(page->property("artists"))==0;
+                }
+            }
+            const bool displayed=cache && cache->property("displayedRoute").toString()==route;
+            const bool routeReady=displayed && active && visibleCount==1
+                && active->property("routeKey").toString()==route
+                && active->property("section").toString()==section;
+            if ((!routeReady || (currentPhase!=401 && cachedCount<1)) && ++state->count<40) {
+                --state->phase;return;
+            }
+            const auto name=currentPhase==404 ? QStringLiteral("songs_return") : section;
+            state->checks[name+"_route_visible"]=routeReady;
+            state->checks[name+"_cached_collections_empty"]=cachedCollectionsEmpty;
+            if (currentPhase!=401) state->checks[name+"_has_cached_page"]=cachedCount>=1;
+            state->measures[name+"_cached_pages"]=cachedCount;
+            if (section==QStringLiteral("songs")) {
+                const auto modelValue=active ? active->property("displayTracksModel") : QVariant{};
+                auto* model=modelValue.value<QObject*>();
+                if (!model && modelValue.canConvert<QJSValue>()) model=modelValue.value<QJSValue>().toQObject();
+                state->checks[name+"_uses_backend_model"]=active && active->property("usingTracksModel").toBool()
+                    && model && uiQmlListSize(active->property("songs"))==0;
+                state->checks[name+"_count_matches_catalog"]=model
+                    && model->property("count").toInt()==state->measures.value("expected_songs").toInt();
+                state->measures[name+"_visible_count"]=model ? model->property("count").toInt() : -1;
+            } else {
+                const auto count=active ? uiQmlListSize(active->property(sectionProperty.constData())) : qsizetype(-1);
+                state->checks[name+"_count_matches_catalog"]=count==state->measures.value(
+                    section==QStringLiteral("albums") ? "expected_albums" : "expected_artists").toInt();
+                state->checks[name+"_other_collection_empty"]=active
+                    && uiQmlListSize(active->property(section==QStringLiteral("albums") ? "artists" : "albums"))==0;
+                state->measures[name+"_visible_count"]=count;
+            }
+            state->count=0;
+            if (currentPhase==401) shell->setProperty("currentRoute",QStringLiteral("library/albums"));
+            if (currentPhase==402) shell->setProperty("currentRoute",QStringLiteral("library/artists"));
+            if (currentPhase==403) shell->setProperty("currentRoute",QStringLiteral("library/songs"));
+            return;
+        }
+        case 405: {
+            timer->stop();
+            bool passed=true;
+            for (const auto& check:state->checks) passed &= check.toBool();
+            state->checks["passed"]=passed;
+            state->checks["measurements"]=state->measures;
+            QFile output(report);
+            if (output.open(QIODevice::WriteOnly)) output.write(QJsonDocument(state->checks).toJson());
+            app.exit(passed?0:7);
+            return;
+        }
+        case 300: {
+            if (!player.ready()) { --state->phase; return; }
+            window->resize(1066,709);window->show();
+            settings.setValue("ui.animations",false);
+            settings.setValue("playback.playActionBehavior","ReplaceCurrentList");
+            const QDir dataDir(qApp->property("listenfreeDataDir").toString());
+            constexpr quint32 sampleRate=8000, seconds=8;
+            const QByteArray pcm(sampleRate*seconds*2,'\0');
+            QByteArray wave;
+            QDataStream stream(&wave,QIODevice::WriteOnly);stream.setByteOrder(QDataStream::LittleEndian);
+            stream.writeRawData("RIFF",4);stream << quint32(36+pcm.size());
+            stream.writeRawData("WAVEfmt ",8);stream << quint32(16) << quint16(1) << quint16(1) << sampleRate;
+            stream << quint32(sampleRate*2) << quint16(2) << quint16(16);
+            stream.writeRawData("data",4);stream << quint32(pcm.size());stream.writeRawData(pcm.constData(),int(pcm.size()));
+            QVariantMap outside;
+            bool filesReady=true;
+            for(int i=0;i<4;++i) {
+                const auto path=dataDir.filePath(QString("play-action-%1.wav").arg(i));
+                QFile file(path);
+                filesReady &= file.open(QIODevice::WriteOnly) && file.write(wave)==wave.size();
+                const QVariantMap row{{"trackId",QString("play-action-%1").arg(i)},
+                    {"title",QString("播放行为验收 %1").arg(i)},
+                    {"artist","ListenFree"},{"durationMs",seconds*1000},{"duration","00:08"},
+                    {"source","Local"},{"localPath",path}};
+                if(i==0) outside=row; else state->fixtureRows.append(row);
+            }
+            state->checks["play_action_fixture_files_created"]=filesReady;
+            if(!filesReady){state->phase=89;return;}
+            state->listId=collections.create("__play_action_fixture__",state->fixtureRows);
+            state->checks["play_action_fixture_playlist_created"]=!state->listId.isEmpty();
+            if(state->listId.isEmpty()){state->phase=89;return;}
+            state->song=state->fixtureRows.at(1).toMap();
+            player.clearQueue();player.enqueueTrack(outside);
+            shell->setProperty("settingsOpen",false);shell->setProperty("nowPlayingOpen",false);
+            shell->setProperty("currentRoute","my-lists");
+            QMetaObject::invokeMethod(shell,"openCollection",Q_ARG(QVariant,QVariant("Playlist")),
+                Q_ARG(QVariant,QVariant("__play_action_fixture__")),Q_ARG(QVariant,QVariant(QColor("#8192a2"))));
+            return;
+        }
+        case 301: {
+            auto* table=item("playlistDetailTracks");
+            const auto value=table?table->property("displayRows"):QVariant{};
+            const auto rows=value.canConvert<QJSValue>()?value.value<QJSValue>().toVariant().toList():value.toList();
+            if((!table || !table->isVisible() || rows.size()!=state->fixtureRows.size()) && ++state->count<20) { --state->phase; return; }
+            bool same=table && table->isVisible() && rows.size()==state->fixtureRows.size();
+            for(int i=0;same && i<rows.size();++i)
+                same=rows.at(i).toMap().value("localPath")==state->fixtureRows.at(i).toMap().value("localPath");
+            state->checks["play_action_visible_list_is_fixture"]=same;
+            state->checks["play_action_initial_queue_is_other_song"]=player.queueSongs().size()==1 &&
+                player.queueSongs().first().toMap().value("localPath")!=state->song.value("localPath");
+            if(!same){state->phase=303;return;}
+            state->pressed=uiSongRowForPath(table,state->song.value("localPath").toString());
+            state->checks["play_action_selected_row_visible"]=state->pressed && state->pressed->isVisible();
+            if(!state->pressed){state->phase=303;return;}
+            auto* button=uiItem(state->pressed,"songRowPlay");
+            if(button) mouse(QEvent::MouseMove,button->mapToScene({button->width()/2,button->height()/2}),Qt::NoButton,Qt::NoButton);
+            return;
+        }
+        case 302: {
+            auto* row=state->pressed.data();auto* button=row?uiItem(row,"songRowPlay"):nullptr;
+            if(button && !button->isVisible() && ++state->count<25) {
+                mouse(QEvent::MouseMove,button->mapToScene({button->width()/2,button->height()/2}),Qt::NoButton,Qt::NoButton);
+                --state->phase;return;
+            }
+            state->checks["play_action_play_button_visible"]=button && button->isVisible();
+            if(button && button->isVisible()) click(button->mapToScene({button->width()/2,button->height()/2}));
+            state->count=0;return;
+        }
+        case 303: {
+            if(player.state()!="Playing" && ++state->count<15){--state->phase;return;}
+            const auto queue=player.queueSongs();
+            bool replaced=queue.size()==state->fixtureRows.size();
+            for(int i=0;replaced && i<queue.size();++i)
+                replaced=queue.at(i).toMap().value("localPath")==state->fixtureRows.at(i).toMap().value("localPath");
+            state->checks["play_action_replaces_queue_with_visible_list"]=replaced;
+            state->checks["play_action_starts_selected_song"]=player.currentQueueIndex()==1 &&
+                player.currentTrack().value("localPath")==state->song.value("localPath") && player.state()=="Playing";
+            state->measures["play_action_queue_count"]=queue.size();
+            state->measures["play_action_state"]=player.state();
+            QMetaObject::invokeMethod(shell,"openNowPlaying");
+            state->count=0;return;
+        }
+        case 304: {
+            auto* star=item("nowPlayingFavoriteButton");
+            if((!shell->property("nowPlayingOpen").toBool() || !star || !star->isVisible()) && ++state->count<15) {
+                --state->phase;return;
+            }
+            auto* media=item("nowPlayingMediaAction");
+            state->checks["nowplaying_star_left_of_media_action"]=star && media && star->isVisible() &&
+                star->parentItem()==media->parentItem() && star->x()<media->x();
+            if(star)click(star->mapToScene({star->width()/2,star->height()/2}));
+            return;
+        }
+        case 305: {
+            auto* menu=item("nowPlayingFavoriteMenu");
+            const auto value=menu?menu->property("actions"):QVariant{};
+            const auto actions=value.canConvert<QJSValue>()?value.value<QJSValue>().toVariant().toList():value.toList();
+            bool header=false,existing=false,create=false;
+            for(const auto& actionValue:actions) {
+                const auto action=actionValue.toMap();
+                header|=action.value("enabled")==false && action.value("label").toString().contains(QStringLiteral("我的收藏"));
+                existing|=action.value("command").toString()==QStringLiteral("list:")+state->listId;
+                create|=action.value("command").toString()==QStringLiteral("create");
+            }
+            state->checks["nowplaying_favorite_menu_opens"]=menu && menu->property("opened").toBool();
+            state->checks["nowplaying_favorite_menu_has_lists_and_create"]=header && existing && create;
+            if(menu && create) {
+                menu->setProperty("opened",false);
+                QMetaObject::invokeMethod(menu,"commandTriggered",Q_ARG(QString,QStringLiteral("create")),
+                    Q_ARG(QVariant,QVariant(player.currentTrack())));
+            }
+            return;
+        }
+        case 306: {
+            state->checks["nowplaying_favorite_create_uses_shared_dialog"]=shell->property("addPlaylistOpen").toBool() &&
+                shell->property("addPlaylistCreateOnly").toBool();
+            shell->setProperty("addPlaylistOpen",false);
+            auto* theme=item("nowPlayingThemeButton");
+            if(theme)click(theme->mapToScene({theme->width()/2,theme->height()/2}));
+            return;
+        }
+        case 307: {
+            auto* theme=item("nowPlayingThemeButton");
+            auto* top=item("topThemeButton");
+            state->checks["theme_buttons_have_no_selected_ring"]=shell->property("darkMode").toBool() &&
+                theme && theme->property("kind").toString()==QStringLiteral("moon") &&
+                !theme->property("selected").toBool() && top && !top->property("selected").toBool();
+            player.stop();player.clearQueue();
+            shell->setProperty("nowPlayingOpen",false);
+            player.tracksModel()->setRows(state->fixtureRows);
+            shell->setProperty("currentRoute","library/songs");
+            if(auto* search=item("globalSearchInput"))search->setProperty("text",QStringLiteral("播放行为验收 2"));
+            state->count=0;return;
+        }
+        case 308: {
+            auto* table=item("songTable");
+            auto* backend=item("songTableBackendList");
+            auto* legacy=item("songTableList");
+            if((!table || !backend || !backend->isVisible() || backend->property("count").toInt()!=1)
+                && ++state->count<20){--state->phase;return;}
+            state->checks["filtered_songs_use_backend_model"]=table && backend && legacy &&
+                backend->isVisible() && !legacy->isVisible() && backend->property("count").toInt()==1;
+            const auto retained=shell->property("selectedCollectionRows");
+            state->checks["leaving_detail_releases_song_rows"]=(retained.canConvert<QJSValue>()
+                ? retained.value<QJSValue>().toVariant().toList() : retained.toList()).isEmpty();
+            state->pressed=uiSongRowForPath(table,state->fixtureRows.at(1).toMap().value("localPath").toString());
+            state->checks["filtered_song_row_matches_query"]=state->pressed && state->pressed->isVisible();
+            if(auto* row=state->pressed.data())if(auto* button=uiItem(row,"songRowPlay"))
+                mouse(QEvent::MouseMove,button->mapToScene({button->width()/2,button->height()/2}),Qt::NoButton,Qt::NoButton);
+            state->count=0;return;
+        }
+        case 309: {
+            auto* row=state->pressed.data();auto* button=row?uiItem(row,"songRowPlay"):nullptr;
+            if(button && !button->isVisible() && ++state->count<20){
+                mouse(QEvent::MouseMove,button->mapToScene({button->width()/2,button->height()/2}),Qt::NoButton,Qt::NoButton);
+                --state->phase;return;
+            }
+            state->checks["filtered_song_play_button_visible"]=button && button->isVisible();
+            if(button && button->isVisible())click(button->mapToScene({button->width()/2,button->height()/2}));
+            state->count=0;return;
+        }
+        case 310: {
+            if(player.state()!="Playing" && ++state->count<15){--state->phase;return;}
+            const auto queue=player.queueSongs();
+            state->checks["filtered_current_list_replaces_queue"]=queue.size()==1 &&
+                queue.first().toMap().value("localPath")==state->fixtureRows.at(1).toMap().value("localPath") &&
+                player.currentQueueIndex()==0 && player.state()=="Playing";
+            player.stop();player.tracksModel()->setRows({});collections.remove(state->listId);
+            if(auto* search=item("globalSearchInput"))search->setProperty("text",QString{});
+            state->phase=89;return;
+        }
         case 200: {
             if(!player.ready()){--state->phase;return;}
             player.stop();window->resize(1066,709);
@@ -70,7 +354,12 @@ inline void runUiRegression(QApplication& app, QQuickWindow* window, QObject* sh
         case 201: case 204: {
             auto* table=item("playlistDetailTracks");
             auto* list=table?uiItem(table,"songTableList"):nullptr;
-            if(!list){state->checks["playlist_detail_available"]=false;state->phase=89;return;}
+            if((!list || !list->property("count").toInt() || table->property("scrollRestorePending").toBool())
+                && ++state->detailWait<20){--state->phase;return;}
+            state->detailWait=0;
+            if(!list || !list->property("count").toInt() || table->property("scrollRestorePending").toBool()){
+                state->checks["playlist_detail_available"]=false;state->phase=89;return;
+            }
             list->setProperty("contentY",1400);return;
         }
         case 202: case 205: {
@@ -78,7 +367,7 @@ inline void runUiRegression(QApplication& app, QQuickWindow* window, QObject* sh
             state->flowTime=list->property("contentY").toDouble();
             const auto rows=collections.detail().value("tracks").toList();state->count=rows.size();
             QMetaObject::invokeMethod(table,"commandRequested",Q_ARG(QString,QString("remove_from_playlist")),
-                Q_ARG(QVariant,rows.at(25)),Q_ARG(int,25));return;
+                Q_ARG(QVariant,rows.at(25)),Q_ARG(int,25),Q_ARG(QVariant,QVariant{}));return;
         }
         case 203: case 206: {
             auto* list=uiItem(item("playlistDetailTracks"),"songTableList");
@@ -96,6 +385,11 @@ inline void runUiRegression(QApplication& app, QQuickWindow* window, QObject* sh
             auto* tabs=item("myFavoritesTabs");
             const QColor color=tabs&&!tabs->childItems().isEmpty()?tabs->childItems().first()->property("color").value<QColor>():QColor();
             const bool light=state->phase==208;
+            const bool ready=color.isValid() && (light
+                ? color.red()>220 && color.green()>220 && color.blue()>220 && color.alpha()>120
+                : color.lightness()<140);
+            if(!ready && ++state->themeWait<15){--state->phase;return;}
+            state->themeWait=0;
             state->checks[light?"light_tab_white_on_dark_artwork":"dark_tab_charcoal"]=color.isValid() &&
                 (light?(color.red()>220 && color.green()>220 && color.blue()>220 && color.alpha()>120):color.lightness()<140);
             state->measures[light?"light_tab_color":"dark_tab_color"]=color.name(QColor::HexArgb);
@@ -286,6 +580,18 @@ inline void runUiRegression(QApplication& app, QQuickWindow* window, QObject* sh
         }
         case 9: {
             state->checks["sidebar_delete_changes_backend"]=player.queueSongs().size()==state->count-1;
+            if (app.arguments().contains("--check-sidebar-queue")) {
+                bool passed=true;
+                for(const auto& name:{"list_reaches_bottom","press_keeps_row_instance",
+                                      "drag_release_does_not_offset_row","row_alignment_after_drag_fold",
+                                      "sidebar_delete_button","sidebar_delete_changes_backend"})
+                    passed &= state->checks.value(name).toBool();
+                state->checks["passed"]=passed;
+                state->checks["measurements"]=state->measures;
+                QFile output(report);
+                if(output.open(QIODevice::WriteOnly))output.write(QJsonDocument(state->checks).toJson());
+                player.stop();timer->stop();app.exit(passed?0:7);return;
+            }
             const QStringList names={"nowPlayingShuffleButton","nowPlayingPreviousButton","nowPlayingPlayPauseButton","nowPlayingNextButton","nowPlayingRepeatButton"};
             double low=1e9,high=-1e9;
             for(const auto& name:names) { auto* button=item(name); const auto y=button->mapToScene({0,button->height()/2}).y(); low=qMin(low,y); high=qMax(high,y); }
@@ -634,7 +940,13 @@ inline void runUiRegression(QApplication& app, QQuickWindow* window, QObject* sh
         }
         case 65: {
             const auto list=[](QVariant v) { return v.canConvert<QJSValue>() ? v.value<QJSValue>().toVariant().toList() : v.toList(); };
-            auto* page=item("libraryPage");const auto rows=page?list(page->property("songs")):QVariantList{};
+            auto* page=item("libraryPage");
+            QVariantList rows;
+            const auto modelValue=page ? page->property("displayTracksModel") : QVariant{};
+            auto* visibleModel=modelValue.value<QObject*>();
+            if (!visibleModel && modelValue.canConvert<QJSValue>()) visibleModel=modelValue.value<QJSValue>().toQObject();
+            if (visibleModel) QMetaObject::invokeMethod(visibleModel,"snapshotRows",Q_RETURN_ARG(QVariantList,rows));
+            else if (page) rows=list(page->property("songs"));
             auto* thumbnail=item("songRowCover");
             state->checks["local_row_thumbnail_loaded"]=thumbnail && !thumbnail->property("missingArtwork").toBool() && thumbnail->property("sourcePixelSize").toInt()<=128;
             state->checks["local_song_search_matches_metadata"]=!rows.isEmpty();

@@ -224,7 +224,8 @@ inline void runImmersiveMemoryProbe(QApplication& app,QQuickWindow* window,QObje
             // This profile is an isolated copy. Start from a deterministic empty
             // queue instead of resuming the user's persisted decoder position.
             player.clearQueue();
-            if(!config["track"].toString().isEmpty())player.openLocal(config["track"].toString());
+            if(!config["url"].toString().isEmpty())player.openUrl(QUrl(config["url"].toString()));
+            else if(!config["track"].toString().isEmpty())player.openLocal(config["track"].toString());
         }else if(action=="nowplaying"){
             shell->setProperty("animationsEnabled",false);shell->setProperty("nowPlayingOpen",true);shell->setProperty("morphProgress",1.);shell->setProperty("coverMorphProgress",1.);shell->setProperty("animationsEnabled",true);
         }else if(action=="enter"){

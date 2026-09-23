@@ -15,6 +15,7 @@ Item {
     property string title: qsTr("播放队列")
     property var rows: []
     property var sourceModel: null
+    property int backendRevision: 0
     property bool fullScreenPresentation: false
     property int currentIndex: sourceModel && sourceModel.currentIndex !== undefined
                                ? sourceModel.currentIndex : -1
@@ -43,6 +44,16 @@ Item {
             return String(value || "--:--")
         const seconds = Math.max(0, Math.floor(value >= 1000 ? value / 1000 : value))
         return Math.floor(seconds / 60) + ":" + String(seconds % 60).padStart(2, "0")
+    }
+
+    function backendRow(index, revision) {
+        return sourceModel ? sourceModel.rowMap(index) : ({})
+    }
+
+    Connections {
+        target: panel.sourceModel
+        ignoreUnknownSignals: true
+        function onDataChanged() { panel.backendRevision++ }
     }
 
     function openRowMenu(rowItem, pointX, pointY, rowIndex, track) {
@@ -244,26 +255,9 @@ Item {
 
         delegate: QueueRow {
             required property int index
-            required property string trackId
-            required property string title
-            required property string artist
-            required property string album
-            required property var duration
-            required property string localPath
-            required property string artwork
-
             rowIndex: index
             ownerList: backendList
-            track: ({
-                trackId: trackId,
-                title: title,
-                artist: artist,
-                album: album,
-                duration: duration,
-                localPath: localPath,
-                artwork: artwork,
-                source: "Local"
-            })
+            track: panel.backendRow(index, panel.backendRevision)
         }
     }
 

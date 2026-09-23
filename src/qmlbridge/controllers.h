@@ -80,6 +80,7 @@ public:
     void endMaintenance();
 signals:
     void scanningChanged();
+    void libraryContentChanged();
     void importedCountChanged();
     void totalCountChanged();
     void lastErrorChanged();

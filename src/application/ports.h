@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -104,6 +105,7 @@ public:
     virtual bool upsert(std::span<const domain::Track> tracks) = 0;
     virtual std::optional<domain::Track> find(const domain::TrackId& id) = 0;
     virtual std::vector<domain::Track> search(const std::string& query) = 0;
+    virtual std::uint64_t count() = 0;
     virtual std::vector<LocalFileFingerprint> localFiles() = 0;
 };
 

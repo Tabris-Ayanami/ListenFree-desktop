@@ -1,7 +1,7 @@
 # ListenFree
 
 Windows 10/11 x64 原生音乐播放器，使用 Qt Quick、Qmmp、QuickJS-ng 和 TagLib。
-安装版及便携版见 [Releases](https://github.com/Tabris-Ayanami/ListenFree-desktop/releases)。运行成品无需安装 Qt、Node.js 或 Python。
+安装版见 [Releases](https://github.com/Tabris-Ayanami/ListenFree-desktop/releases)。运行成品无需安装 Qt、Node.js 或 Python。
 
 ## 构建输入
 
@@ -31,13 +31,13 @@ Windows 10/11 x64 原生音乐播放器，使用 Qt Quick、Qmmp、QuickJS-ng �
 
 脚本通过 CMake 构建 Release，部署到 dist/ListenFree-Portable 并做隔离启动检查。重新部署保留该目录的个人 data。CMakePresets.json 提供当前工具链的 portable 预设，可用 CMakeUserPresets.json 覆盖本机路径。
 
-安装 Inno Setup 6 和 7-Zip 后生成干净的安装版与便携 ZIP：
+安装 Inno Setup 6 后生成 0.3.5 安装版：
 
 ```powershell
-./scripts/windows/package-release.ps1 -Version 0.3.4
+./scripts/windows/package-release.ps1 -Version 0.3.5 -InstallerOnly
 ```
 
-只生成安装包时追加 `-InstallerOnly`，无需 7-Zip。只生成便携 ZIP 时追加 `-PortableOnly`，无需安装 Inno Setup。0.3.4 的本地整合内容见 [更新说明](packaging/release-notes-0.3.4.txt)。
+省略 `-InstallerOnly` 并安装 7-Zip 时，脚本仍可生成便携 ZIP；0.3.5 的 GitHub Release 只发布安装包与更新清单。改动见 [更新说明](packaging/release-notes-0.3.5.txt)。
 
 使用已经验收的运行库目录可传入 `-RuntimeDirectory <目录>`；追加 `-SkipChecksums` 可只生成安装包和便携 ZIP，不生成校验文件。
 

@@ -30,8 +30,8 @@ Item {
         if (state.songs) resultTable.restoreNavigationState(state.songs)
         gridPosition.restoreNavigationState(state.y)
     }
-    signal trackActivated(var track)
-    signal trackCommandRequested(string command, var track, int rowIndex)
+    signal trackActivated(var track, var playbackContext)
+    signal trackCommandRequested(string command, var track, int rowIndex, var playbackContext)
     signal trackSortRequested(string column, string order)
     signal collectionActivated(var collection)
 
@@ -91,8 +91,8 @@ Item {
         rows: visible ? page.resultRows : []
         footer: visible && page.hasOnlineQuery ? paginationFooter : null
         darkMode: page.darkMode
-        onTrackActivated: row => page.trackActivated(row)
-        onCommandRequested: (command, track, rowIndex) => page.trackCommandRequested(command, track, rowIndex)
+        onTrackActivated: (row, playbackContext) => page.trackActivated(row, playbackContext)
+        onCommandRequested: (command, track, rowIndex, playbackContext) => page.trackCommandRequested(command, track, rowIndex, playbackContext)
         onSortChanged: (column, order) => page.trackSortRequested(column, order)
     }
     GridView {

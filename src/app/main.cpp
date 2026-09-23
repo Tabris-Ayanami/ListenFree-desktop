@@ -7,6 +7,7 @@
 #include "infrastructure/database/repositories.h"
 #include "infrastructure/library/library_scanner.h"
 #include "qmlbridge/controllers.h"
+#include "qmlbridge/list_models.h"
 #include "qmlbridge/spring_value.h"
 #include "qmlbridge/lyric_text_metrics.h"
 #include "qmlbridge/album_mosaic_model.h"
@@ -61,7 +62,7 @@ int main(int argc, char* argv[]) {
     app.setWindowIcon(QIcon(":/qt/qml/ListenFree/Bootstrap/music_player_desktop/assets/icons/app.png"));
     app.setApplicationName("ListenFree");
     app.setOrganizationName("ListenFree");
-    app.setApplicationVersion("0.3.4");
+    app.setApplicationVersion("0.3.5");
 #ifdef Q_OS_WIN
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     listenfree::WindowsMediaSession::registerApplicationIdentity("ListenFree.Desktop", "ListenFree");
@@ -104,8 +105,7 @@ int main(int argc, char* argv[]) {
     listenfree::qmlbridge::PortableSession controller(database, databasePath, sourceController);
     listenfree::qmlbridge::ImmersiveController immersive;
     const auto syncImmersive = [&] { immersive.setPlayback(controller.position(), controller.state() == "Playing", controller.currentTrack().value("entryId").toString() + ":" + controller.currentTrackId()); };
-    QObject::connect(&controller, &listenfree::qmlbridge::PortableSession::changed, &immersive, syncImmersive);
-    QObject::connect(&controller, &listenfree::qmlbridge::PortableSession::currentTrackChanged, &immersive, syncImmersive);
+    QObject::connect(&controller, &listenfree::qmlbridge::PortableSession::progressChanged, &immersive, syncImmersive);
     listenfree::qmlbridge::LibraryController libraryController(libraryScanner, trackRepository,
                                                                &libraryFolderRepository, databasePath);
 
@@ -135,8 +135,10 @@ int main(int argc, char* argv[]) {
     QObject::connect(&downloads, &listenfree::qmlbridge::DownloadService::fileCompleted,
                      &libraryController, &listenfree::qmlbridge::LibraryController::notifyFileCompleted);
     QObject::connect(&libraryController, &listenfree::qmlbridge::LibraryController::scanningChanged, &controller, [&] {
-        if (!libraryController.scanning()) controller.reload();
+        if (!libraryController.scanning()) controller.reloadCatalogChanges();
     });
+    QObject::connect(&libraryController, &listenfree::qmlbridge::LibraryController::libraryContentChanged,
+                     &controller, &listenfree::qmlbridge::PortableSession::reloadCatalogChanges);
     QObject::connect(&controller, &listenfree::qmlbridge::PortableSession::localLibraryChanged,
                      &libraryController, &listenfree::qmlbridge::LibraryController::refreshTotalCount);
     QObject::connect(&app, &QCoreApplication::aboutToQuit, &controller, [&] { libraryController.cancel(); controller.shutdown(); });
@@ -157,6 +159,7 @@ int main(int argc, char* argv[]) {
     qmlRegisterType<FoliaDecorItem>("ListenFree.Native", 1, 0, "FoliaDecor");
     qmlRegisterType<ImmersiveSpectrumItem>("ListenFree.Native", 1, 0, "ImmersiveSpectrum");
     qmlRegisterType<AlbumMosaicModel>("ListenFree.Native", 1, 0, "AlbumMosaicModel");
+    qmlRegisterType<listenfree::qmlbridge::FilteredTrackModel>("ListenFree.Native", 1, 0, "FilteredTrackModel");
     QQmlApplicationEngine engine;
     UiTranslator translator;
     const auto applyLanguage=[&] {
@@ -174,7 +177,7 @@ int main(int argc, char* argv[]) {
     engine.rootContext()->setContextProperty("backendWallpaperLibrary", wallpaperLibrary);
     engine.rootContext()->setContextProperty("backendDuplicates",&duplicates);
     engine.rootContext()->setContextProperty("backendShortcuts", &shortcuts);
-    engine.addImageProvider("covers", new CoverImageProvider);
+    engine.addImageProvider("covers", new CoverImageProvider(controller.collectionCoverIndex()));
     engine.addImageProvider("artwork", new RemoteArtworkProvider);
     engine.rootContext()->setContextProperty("backendArtworkTextures", true);
     auto* artworkVideoFactory = new listenfree::media::ArtworkVideoFactory(&engine);

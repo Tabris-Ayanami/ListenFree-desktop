@@ -29,8 +29,8 @@ Item {
     property bool editablePlaylist: false
     signal playAllRequested
     signal saveRequested
-    signal trackActivated(var track)
-    signal trackCommandRequested(string command, var track, int rowIndex)
+    signal trackActivated(var track, var playbackContext)
+    signal trackCommandRequested(string command, var track, int rowIndex, var playbackContext)
     signal trackSortRequested(string column, string order)
     signal transitionGeometryChanged(rect frameRect, rect artworkRect)
 
@@ -106,8 +106,8 @@ Item {
             playlistMode: page.editablePlaylist
             scrollKey: "collection." + page.kind + "." + page.title
             darkMode: page.darkMode
-            onTrackActivated: row => page.trackActivated(row)
-            onCommandRequested: (command,track,index) => page.trackCommandRequested(command,track,index)
+            onTrackActivated: (row, playbackContext) => page.trackActivated(row, playbackContext)
+            onCommandRequested: (command,track,index,playbackContext) => page.trackCommandRequested(command,track,index,playbackContext)
             onSortChanged: (column,order) => page.trackSortRequested(column,order)
         }
     }
@@ -126,8 +126,8 @@ Item {
         id: cell
         property int number: 0
         rowIndex: number
-        onActivated: page.trackActivated(track)
-        onCommandRequested: command => page.trackCommandRequested(command,track,number)
+        onActivated: page.trackActivated(track, page.visibleRows)
+        onCommandRequested: command => page.trackCommandRequested(command,track,number,page.visibleRows)
         onContextRequested: (mx,my) => { const p = mapToItem(page,mx,my); detailMenu.openAt(p.x,p.y,{ track: track, rowIndex: page.visibleRows.indexOf(track) }) }
     }
     Loader {
@@ -163,8 +163,8 @@ Item {
                 canvasText: false; lightText: true
                 rows: page.visibleRows
                 fallbackArtwork: page.artworkSource
-                onTrackActivated: track => page.trackActivated(track)
-                onCommandRequested: (command,track,index) => page.trackCommandRequested(command,track,index)
+                onTrackActivated: (track, playbackContext) => page.trackActivated(track, playbackContext)
+                onCommandRequested: (command,track,index,playbackContext) => page.trackCommandRequested(command,track,index,playbackContext)
             }
             RoundIconButton { anchors.right: parent.right; anchors.rightMargin: 14; y: 12; diameter: 32; kind: "close"; glyphColor: "#f0f4f8"; transparentSurface: true; onClicked: page.backRequested() }
         }
@@ -303,7 +303,7 @@ Item {
         objectName: "artistSongContextMenu"
         anchors.fill: parent
         darkMode: page.darkMode
-        onCommandTriggered: (command,context) => page.trackCommandRequested(command,context.track,context.rowIndex)
+        onCommandTriggered: (command,context) => page.trackCommandRequested(command,context.track,context.rowIndex,page.visibleRows)
     }
 
     Text {

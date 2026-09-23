@@ -243,6 +243,8 @@ bool LibraryController::removeRoot(const QString& path) {
         if (scanning_) {
             scanning_ = false;
             emit scanningChanged();
+        } else {
+            emit libraryContentChanged();
         }
         return true;
     } catch (const std::exception&) {
@@ -588,7 +590,7 @@ void LibraryController::refreshRoots() {
 void LibraryController::refreshTotalCount() {
     quint64 count{0};
     try {
-        count = static_cast<quint64>(repository_.search("").size());
+        count = static_cast<quint64>(repository_.count());
     } catch (const std::exception&) {
         count = 0;
     }

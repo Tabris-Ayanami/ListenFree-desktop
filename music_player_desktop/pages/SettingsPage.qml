@@ -102,6 +102,7 @@ Item {
         autoPlayOnLaunch: "playback.autoPlayOnLaunch",
         restorePosition: "playback.restorePosition",
         defaultPlaybackMode: "playback.defaultMode",
+        playActionBehavior: "playback.playActionBehavior",
         clearShuffleHistory: "playback.clearShuffleHistory",
         outputDeviceId: "audio.outputDeviceId",
         pauseOnDeviceRemoval: "audio.pauseOnDeviceRemoval",
@@ -780,6 +781,7 @@ Item {
                     { title: qsTr("启动后自动播放"), detail: qsTr("仅在恢复的队列中存在可播放歌曲时生效。"), key: page.settingKeys.autoPlayOnLaunch, type: "toggle", checked: false },
                     { title: qsTr("恢复播放位置"), detail: qsTr("恢复队列、当前歌曲和进度。"), key: page.settingKeys.restorePosition, type: "toggle", checked: true },
                     { title: qsTr("默认播放模式"), detail: qsTr("浮岛运行时选择会同步覆盖此值。"), key: page.settingKeys.defaultPlaybackMode, type: "select", options: [{label:qsTr("列表循环"),value:"LoopAll"},{label:qsTr("随机播放"),value:"Shuffle"},{label:qsTr("单曲循环"),value:"LoopOne"},{label:qsTr("播完停止"),value:"StopAfterCurrent"}], currentIndex: 0 },
+                    { title: qsTr("歌曲播放行为"), detail: qsTr("双击歌曲或点击播放时，决定如何使用所在列表。"), key: page.settingKeys.playActionBehavior, type: "select", options: [{label:qsTr("加入到队列"),value:"AppendToQueue"},{label:qsTr("切换到当前列表"),value:"ReplaceCurrentList"}], currentIndex: 0 },
                     { title: qsTr("随机播放后清理历史"), detail: qsTr("一轮播放后重新随机；关闭则保留本轮随机顺序。"), key: page.settingKeys.clearShuffleHistory, type: "toggle", checked: true }
                 ]
                 onSettingChanged: (key, value) => page.handleSettingChanged(key, value)
@@ -1247,7 +1249,7 @@ Item {
                 primaryText: page.primaryText
                 secondaryText: page.secondaryText
                 rows: [
-                    { title: "ListenFree", detail: qsTr("构建于 Qt 6.11.2。"), type: "info", readOnlyValue: "0.3.4" },
+                    { title: "ListenFree", detail: qsTr("构建于 Qt 6.11.2。"), type: "info", readOnlyValue: "0.3.5" },
                     { title: qsTr("复制诊断信息"), detail: qsTr("不会包含账号凭据和完整日志。"), key: page.settingKeys.copyDiagnostics, type: "action", actionLabel: qsTr("复制") },
                     { title: qsTr("检查软件更新"), detail: qsTr("检查 GitHub 新版本，可查看说明、下载并安装更新。"), key: page.settingKeys.checkUpdates, type: "action", actionLabel: qsTr("检查") },
                     { title: qsTr("打开下载页面"), detail: qsTr("使用系统浏览器打开 GitHub Releases。"), key: page.settingKeys.openReleasePage, type: "action", actionLabel: qsTr("打开") },

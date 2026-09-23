@@ -339,6 +339,14 @@ inline constexpr char settingsSchema[] = R"json({
       "StopAfterCurrent"
     ]
   },
+  "playback.playActionBehavior": {
+    "category": "playback",
+    "default": "AppendToQueue",
+    "values": [
+      "AppendToQueue",
+      "ReplaceCurrentList"
+    ]
+  },
   "playback.preventSystemSleep": {
     "category": "playback",
     "default": true

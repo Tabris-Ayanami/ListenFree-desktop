@@ -26,6 +26,12 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QQmlComponent>
+#include <QQmlEngine>
+#include <QElapsedTimer>
+#include <QTimer>
+#include <chrono>
+#include <cstdio>
 #include <taglib/mpegfile.h>
 #include <QTemporaryDir>
 #include <QTest>
@@ -45,6 +51,373 @@ class PortableTests : public QObject {
     QString mp3_, flac_, third_, originalPcm_;
     QVariantMap local(const QString& path) { return {{"trackId", path}, {"title", QFileInfo(path).completeBaseName()}, {"localPath", path}}; }
 private slots:
+    void catalogReloadPublishesReentrantLatestSnapshot() {
+        infrastructure::database::Database db;
+        const auto path = temporary_.filePath("catalog-reentrant.sqlite");
+        QVERIFY(db.open(path));
+        QVERIFY(db.migrate());
+        QVERIFY(db.setSetting("library.metadataRelationsVersion", "1"));
+        const auto makeTrack = [](const char* id, const char* title) {
+            domain::Track track;
+            track.id = domain::TrackId(id);
+            track.title = title;
+            track.artists.push_back({"fixture-artist", "Fixture Artist"});
+            track.album = domain::Album{"fixture-album", "Fixture Album", std::nullopt};
+            track.remoteUrl = std::string("https://example.invalid/") + id;
+            return track;
+        };
+        QVERIFY(db.upsertTrack(makeTrack("catalog-a", "A")));
+        infrastructure::database::SettingsRepository repo(db);
+        qmlbridge::SourceController source(&repo);
+        qmlbridge::PortableSession player(db, path, source);
+        QTRY_VERIFY_WITH_TIMEOUT(player.ready() && player.songs().size() == 1, 8000);
+        QSignalSpy published(&player, &qmlbridge::PortableSession::catalogChanged);
+        bool requestedDuringPublish = false;
+        connect(&player, &qmlbridge::PortableSession::catalogChanged, &player, [&] {
+            if (requestedDuringPublish) return;
+            requestedDuringPublish = true;
+            QVERIFY(db.upsertTrack(makeTrack("catalog-b", "B")));
+            player.reloadCatalogChanges();
+        });
+        player.reload();
+        QTRY_COMPARE_WITH_TIMEOUT(published.size(), 2, 8000);
+        QCOMPARE(player.songs().size(), 2);
+        QCOMPARE(player.tracksModel()->snapshotRows(), player.songs());
+        QCOMPARE(player.albums().size(), 1);
+        QCOMPARE(player.albums().first().toMap().value("count").toInt(), 2);
+        QCOMPARE(player.artists().size(), 1);
+        QCOMPARE(player.artists().first().toMap().value("albumCount").toInt(), 1);
+    }
+
+    void catalogReloadUpdatesOnlyChangedMetadataRow() {
+        infrastructure::database::Database db;
+        const auto path = temporary_.filePath("catalog-metadata-update.sqlite");
+        QVERIFY(db.open(path));
+        QVERIFY(db.migrate());
+        QVERIFY(db.setSetting("library.metadataRelationsVersion", "1"));
+        const auto makeTrack = [](const char* id, const char* title, int duration) {
+            domain::Track track;
+            track.id = domain::TrackId(id);
+            track.title = title;
+            track.duration = std::chrono::milliseconds(duration);
+            track.remoteUrl = std::string("https://example.invalid/") + id;
+            return track;
+        };
+        QVERIFY(db.upsertTrack(makeTrack("metadata-a", "A", 1000)));
+        QVERIFY(db.upsertTrack(makeTrack("metadata-b", "B", 2000)));
+        QVERIFY(db.upsertTrack(makeTrack("metadata-c", "C", 3000)));
+        infrastructure::database::SettingsRepository repo(db);
+        qmlbridge::SourceController source(&repo);
+        qmlbridge::PortableSession player(db, path, source);
+        QTRY_VERIFY_WITH_TIMEOUT(player.ready() && player.songs().size() == 3, 8000);
+        auto* model = player.tracksModel();
+        const QPersistentModelIndex anchored(model->index(1, 0));
+        QSignalSpy published(&player, &qmlbridge::PortableSession::catalogChanged);
+        QSignalSpy reset(model, &QAbstractItemModel::modelReset);
+        QSignalSpy updated(model, &QAbstractItemModel::dataChanged);
+        QSignalSpy inserted(model, &QAbstractItemModel::rowsInserted);
+        QSignalSpy removed(model, &QAbstractItemModel::rowsRemoved);
+        QVERIFY(db.upsertTrack(makeTrack("metadata-b", "B", 2500)));
+        player.reloadCatalogChanges();
+        QTRY_COMPARE_WITH_TIMEOUT(published.size(), 1, 8000);
+        QCOMPARE(reset.size(), 0);
+        QCOMPARE(inserted.size(), 0);
+        QCOMPARE(removed.size(), 0);
+        QCOMPARE(updated.size(), 1);
+        QCOMPARE(updated.at(0).at(0).toModelIndex().row(), 1);
+        QVERIFY(anchored.isValid());
+        QCOMPARE(model->data(anchored, qmlbridge::TrackListModel::TrackIdRole).toString(), QString("metadata-b"));
+        QCOMPARE(model->data(anchored, qmlbridge::TrackListModel::DurationRole).toInt(), 2500);
+        QCOMPARE(model->snapshotRows(), player.songs());
+        QVERIFY(player.lastCatalogUsedDelta());
+        QCOMPARE(player.lastCatalogHydratedRows(), qsizetype(1));
+
+        // The reader sorts by title, so this edit changes row identity order.
+        // The bounded metadata path must safely return to the reset contract.
+        published.clear();
+        QVERIFY(db.upsertTrack(makeTrack("metadata-b", "Z", 2500)));
+        player.reloadCatalogChanges();
+        QTRY_COMPARE_WITH_TIMEOUT(published.size(), 1, 8000);
+        QCOMPARE(reset.size(), 1);
+        QVERIFY(!player.lastCatalogUsedDelta());
+        QCOMPARE(model->snapshotRows(), player.songs());
+        QCOMPARE(model->get(2).value("trackId").toString(), QString("metadata-b"));
+
+        player.sortTracks(QStringLiteral("title"), QStringLiteral("descending"));
+        QCOMPARE(model->get(0).value("trackId").toString(), QString("metadata-b"));
+        published.clear();
+        QVERIFY(db.upsertTrack(makeTrack("metadata-a", "A", 1500)));
+        player.reloadCatalogChanges();
+        QTRY_COMPARE_WITH_TIMEOUT(published.size(), 1, 8000);
+        QVERIFY(!player.lastCatalogUsedDelta());
+        QCOMPARE(model->get(0).value("trackId").toString(), QString("metadata-a"));
+    }
+
+    void catalogDeltaUpdatesSharedRelationsAndFallsBackForDeletion() {
+        infrastructure::database::Database db;
+        const auto path = temporary_.filePath("catalog-shared-relations.sqlite");
+        QVERIFY(db.open(path));
+        QVERIFY(db.setSetting("library.metadataRelationsVersion", "1"));
+        const auto makeTrack = [](const char* id, const char* title, const char* artistId,
+                                  const char* artistName, const char* albumId,
+                                  const char* albumTitle, const char* artwork) {
+            domain::Track track;
+            track.id = domain::TrackId(id);
+            track.title = title;
+            track.remoteUrl = std::string("https://example.invalid/") + id;
+            track.artists.push_back({artistId, artistName});
+            track.album = domain::Album{albumId, albumTitle, std::string(artwork)};
+            return track;
+        };
+        QVERIFY(db.upsertTrack(makeTrack("shared-a", "A", "shared-artist", "Old Artist",
+                                         "shared-album", "Old Album", "https://example.invalid/old.jpg")));
+        QVERIFY(db.upsertTrack(makeTrack("shared-b", "B", "shared-artist", "Old Artist",
+                                         "shared-album", "Old Album", "https://example.invalid/old.jpg")));
+        QVERIFY(db.upsertTrack(makeTrack("other-c", "C", "other-artist", "Other Artist",
+                                         "other-album", "Other Album", "https://example.invalid/other.jpg")));
+        infrastructure::database::SettingsRepository repo(db);
+        qmlbridge::SourceController source(&repo);
+        qmlbridge::PortableSession player(db, path, source);
+        QTRY_VERIFY_WITH_TIMEOUT(player.ready() && player.songs().size() == 3, 8000);
+        QSignalSpy published(&player, &qmlbridge::PortableSession::catalogChanged);
+        QSignalSpy reset(player.tracksModel(), &QAbstractItemModel::modelReset);
+        QSignalSpy updated(player.tracksModel(), &QAbstractItemModel::dataChanged);
+        QVERIFY(db.upsertTrack(makeTrack("shared-a", "A", "shared-artist", "New Artist",
+                                         "shared-album", "New Album", "https://example.invalid/new.jpg")));
+        player.reloadCatalogChanges();
+        QTRY_COMPARE_WITH_TIMEOUT(published.size(), 1, 8000);
+        QVERIFY(player.lastCatalogUsedDelta());
+        QCOMPARE(player.lastCatalogHydratedRows(), qsizetype(2));
+        QCOMPARE(reset.size(), 0);
+        QVERIFY(!updated.isEmpty());
+        for (int row = 0; row < 2; ++row) {
+            const auto values = player.songs().at(row).toMap();
+            QCOMPARE(values.value("artist").toString(), QString("New Artist"));
+            QCOMPARE(values.value("album").toString(), QString("New Album"));
+            QCOMPARE(values.value("artwork").toString(), QString("https://example.invalid/new.jpg"));
+        }
+        QCOMPARE(player.albums().size(), 2);
+        QCOMPARE(player.albums().first().toMap().value("count").toInt(), 2);
+        QCOMPARE(player.artists().first().toMap().value("albumCount").toInt(), 1);
+        published.clear();
+        QVERIFY(db.removeTrack("shared-b"));
+        player.reloadCatalogChanges();
+        QTRY_COMPARE_WITH_TIMEOUT(published.size(), 1, 8000);
+        QVERIFY(!player.lastCatalogUsedDelta());
+        QCOMPARE(player.songs().size(), 2);
+        QCOMPARE(reset.size(), 1);
+    }
+
+    void catalogExplicitReloadRefreshesLocalArtworkVersion() {
+        infrastructure::database::Database db;
+        const auto path = temporary_.filePath("catalog-artwork-version.sqlite");
+        QVERIFY(db.open(path));
+        QVERIFY(db.setSetting("library.metadataRelationsVersion", "1"));
+        const auto mediaPath = temporary_.filePath("catalog-artwork-version.mp3");
+        QFile media(mediaPath);
+        QVERIFY(media.open(QIODevice::WriteOnly));
+        QCOMPARE(media.write("a"), qint64(1));
+        media.close();
+        domain::Track track;
+        track.id = domain::TrackId("artwork-version");
+        track.title = "Artwork Version";
+        track.localPath = mediaPath.toStdString();
+        QVERIFY(db.upsertTrack(track));
+        infrastructure::database::SettingsRepository repo(db);
+        qmlbridge::SourceController source(&repo);
+        qmlbridge::PortableSession player(db, path, source);
+        QTRY_VERIFY_WITH_TIMEOUT(player.ready() && player.songs().size() == 1, 8000);
+        const auto before = player.songs().first().toMap().value("artwork").toString();
+        QVERIFY(media.open(QIODevice::WriteOnly | QIODevice::Append));
+        QCOMPARE(media.write("bc"), qint64(2));
+        media.close();
+        QSignalSpy published(&player, &qmlbridge::PortableSession::catalogChanged);
+        player.reload();
+        QTRY_COMPARE_WITH_TIMEOUT(published.size(), 1, 8000);
+        QVERIFY(!player.lastCatalogUsedDelta());
+        const auto after = player.songs().first().toMap().value("artwork").toString();
+        QVERIFY(!after.isEmpty());
+        QVERIFY(after != before);
+    }
+
+    void catalogKnownCommitWithoutChangesSkipsReload() {
+        infrastructure::database::Database db;
+        const auto path = temporary_.filePath("catalog-noop-scan.sqlite");
+        QVERIFY(db.open(path));
+        QVERIFY(db.setSetting("library.metadataRelationsVersion", "1"));
+        domain::Track track;
+        track.id = domain::TrackId("catalog-stable");
+        track.title = "Stable";
+        QVERIFY(db.upsertTrack(track));
+        infrastructure::database::SettingsRepository repo(db);
+        qmlbridge::SourceController source(&repo);
+        qmlbridge::PortableSession player(db, path, source);
+        QTRY_VERIFY_WITH_TIMEOUT(player.ready() && player.songs().size() == 1, 8000);
+        QSignalSpy published(&player, &qmlbridge::PortableSession::catalogChanged);
+        QSignalSpy reset(player.tracksModel(), &QAbstractItemModel::modelReset);
+        player.reloadCatalogChanges();
+        QTest::qWait(800);
+        QCOMPARE(published.size(), 0);
+        QCOMPARE(reset.size(), 0);
+        track.duration = std::chrono::milliseconds(2500);
+        QVERIFY(db.upsertTrack(track));
+        player.reloadCatalogChanges();
+        QTRY_COMPARE_WITH_TIMEOUT(published.size(), 1, 8000);
+        QVERIFY(player.lastCatalogUsedDelta());
+        QCOMPARE(player.lastCatalogHydratedRows(), qsizetype(1));
+        QCOMPARE(player.songs().first().toMap().value("durationMs").toLongLong(), qint64(2500));
+    }
+
+    void catalogReloadGuiLatencyBenchmark() {
+        const int count = qEnvironmentVariableIntValue("LISTENFREE_CATALOG_BENCH_ROWS");
+        if (count <= 0) QSKIP("Set LISTENFREE_CATALOG_BENCH_ROWS to run the isolated catalog benchmark");
+        // The sampler uses these emitted wall-clock boundaries to label its
+        // timestamped memory samples. Flush so even a failed test retains the
+        // last completed phase; validation and settling stay out of loadMs.
+        const auto phase = [](const char* name) {
+            const auto epochNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            std::fprintf(stdout, "LF_BENCH_PHASE|%s|%lld\n", name, static_cast<long long>(epochNs));
+            std::fflush(stdout);
+        };
+        phase("fixture_start");
+        const auto path = temporary_.filePath("catalog-reload-benchmark.sqlite");
+        infrastructure::database::Database db;
+        QVERIFY(db.open(path));
+        QVERIFY(db.migrate());
+        QVERIFY(db.setSetting("library.metadataRelationsVersion", "1"));
+        std::vector<domain::Track> fixtures;
+        fixtures.reserve(static_cast<std::size_t>(count));
+        for (int i = 0; i < count; ++i) {
+            domain::Track track;
+            track.id = domain::TrackId(QStringLiteral("benchmark-%1").arg(i, 7, 10, QLatin1Char('0')).toStdString());
+            track.title = QStringLiteral("Track %1").arg(i, 7, 10, QLatin1Char('0')).toStdString();
+            const auto artist = QStringLiteral("Artist %1").arg(i % 60, 3, 10, QLatin1Char('0')).toStdString();
+            const auto album = QStringLiteral("Album %1").arg(i % 300, 3, 10, QLatin1Char('0')).toStdString();
+            track.artists.push_back({artist, artist});
+            track.album = domain::Album{album, album, std::nullopt};
+            track.localPath = temporary_.filePath(QStringLiteral("music/%1.flac").arg(i)).toStdString();
+            track.duration = std::chrono::milliseconds(180000 + i % 1000);
+            fixtures.push_back(std::move(track));
+        }
+        QVERIFY(db.upsertTracks(fixtures));
+        fixtures.clear();
+        fixtures.shrink_to_fit();
+
+        infrastructure::database::SettingsRepository repo(db);
+        qmlbridge::SourceController source(&repo);
+        phase("fixture_end");
+        phase("preSteady_start");
+        QTest::qWait(800);
+        phase("preSteady_end");
+        phase("cold_start");
+        QElapsedTimer elapsed;
+        elapsed.start();
+        qint64 lastTickNs = elapsed.nsecsElapsed();
+        qint64 maxGapNs = 0;
+        int heartbeatTicks = 0;
+        QTimer heartbeat;
+        heartbeat.setTimerType(Qt::PreciseTimer);
+        heartbeat.setInterval(1);
+        connect(&heartbeat, &QTimer::timeout, this, [&] {
+            const auto now = elapsed.nsecsElapsed();
+            maxGapNs = std::max(maxGapNs, now - lastTickNs);
+            lastTickNs = now;
+            ++heartbeatTicks;
+        });
+        heartbeat.start();
+        qmlbridge::PortableSession player(db, path, source);
+        QTRY_VERIFY_WITH_TIMEOUT(player.ready() && player.songs().size() == count, 60000);
+        heartbeat.stop();
+        maxGapNs = std::max(maxGapNs, elapsed.nsecsElapsed() - lastTickNs);
+        const auto coldLoadMs = elapsed.elapsed();
+        phase("cold_end");
+        phase("coldValidation_start");
+        QCOMPARE(player.tracksModel()->rowCount(), count);
+        QCOMPARE(player.artists().size(), 60);
+        QCOMPARE(player.albums().size(), 300);
+        const auto validateProjection = [&](int changedIndex, qint64 changedDuration) {
+            const auto songs = player.songs();
+            const auto modelRows = player.tracksModel()->snapshotRows();
+            if (songs.size() != count || modelRows != songs) return false;
+            for (int i = 0; i < count; ++i) {
+                const auto row = songs.at(i).toMap();
+                const auto id = QStringLiteral("benchmark-%1").arg(i, 7, 10, QLatin1Char('0'));
+                const auto title = QStringLiteral("Track %1").arg(i, 7, 10, QLatin1Char('0'));
+                const auto artist = QStringLiteral("Artist %1").arg(i % 60, 3, 10, QLatin1Char('0'));
+                const auto album = QStringLiteral("Album %1").arg(i % 300, 3, 10, QLatin1Char('0'));
+                const auto duration = i == changedIndex ? changedDuration : 180000 + i % 1000;
+                if (row.value("trackId").toString() != id || row.value("title").toString() != title ||
+                    row.value("artist").toString() != artist || row.value("album").toString() != album ||
+                    row.value("durationMs").toLongLong() != duration ||
+                    row.value("localPath").toString() != temporary_.filePath(QStringLiteral("music/%1.flac").arg(i)) ||
+                    player.tracksModel()->data(player.tracksModel()->index(i, 0),
+                                                qmlbridge::TrackListModel::TrackIdRole).toString() != id)
+                    return false;
+            }
+            return true;
+        };
+        QVERIFY(validateProjection(-1, 0));
+        phase("coldValidation_end");
+        QJsonObject metrics{{"rows", count}, {"loadMs", coldLoadMs},
+                            {"maxGuiGapMs", double(maxGapNs) / 1000000.0},
+                            {"heartbeatTicks", heartbeatTicks},
+                            {"coldProjectionCheckedRows", count},
+                            {"coldHydratedRows", static_cast<qint64>(player.lastCatalogHydratedRows())},
+                            {"coldUsedDelta", player.lastCatalogUsedDelta()}};
+        if (qEnvironmentVariableIntValue("LISTENFREE_CATALOG_BENCH_WARM") == 1) {
+            phase("warm_start");
+            const int target = count / 2;
+            const auto id = domain::TrackId(QStringLiteral("benchmark-%1").arg(target, 7, 10, QLatin1Char('0')).toStdString());
+            auto changedTrack = db.findTrack(id);
+            QVERIFY(changedTrack.has_value());
+            changedTrack->duration += std::chrono::milliseconds(1000);
+            const auto expectedMs = changedTrack->duration.count();
+            QVERIFY(db.upsertTrack(*changedTrack));
+            QSignalSpy published(&player, &qmlbridge::PortableSession::catalogChanged);
+            QSignalSpy reset(player.tracksModel(), &QAbstractItemModel::modelReset);
+            QSignalSpy updated(player.tracksModel(), &QAbstractItemModel::dataChanged);
+            QSignalSpy inserted(player.tracksModel(), &QAbstractItemModel::rowsInserted);
+            QSignalSpy removed(player.tracksModel(), &QAbstractItemModel::rowsRemoved);
+            elapsed.start();
+            lastTickNs = elapsed.nsecsElapsed();
+            maxGapNs = 0;
+            heartbeatTicks = 0;
+            heartbeat.start();
+            player.reloadCatalogChanges();
+            QTRY_COMPARE_WITH_TIMEOUT(published.size(), 1, 60000);
+            heartbeat.stop();
+            maxGapNs = std::max(maxGapNs, elapsed.nsecsElapsed() - lastTickNs);
+            const auto warmLoadMs = elapsed.elapsed();
+            phase("warm_end");
+            phase("warmValidation_start");
+            QCOMPARE(player.songs().at(target).toMap().value("durationMs").toLongLong(), expectedMs);
+            QCOMPARE(player.tracksModel()->rowCount(), count);
+            QVERIFY(validateProjection(target, expectedMs));
+            metrics["warmReloadMs"] = warmLoadMs;
+            metrics["warmMaxGuiGapMs"] = double(maxGapNs) / 1000000.0;
+            metrics["warmHeartbeatTicks"] = heartbeatTicks;
+            metrics["warmModelResets"] = reset.size();
+            metrics["warmDataChanges"] = updated.size();
+            metrics["warmRowsInserted"] = inserted.size();
+            metrics["warmRowsRemoved"] = removed.size();
+            metrics["warmProjectionCheckedRows"] = count;
+            metrics["warmHydratedRows"] = static_cast<qint64>(player.lastCatalogHydratedRows());
+            metrics["warmUsedDelta"] = player.lastCatalogUsedDelta();
+            phase("warmValidation_end");
+        }
+        phase("postSteady_start");
+        QTest::qWait(800);
+        phase("postSteady_end");
+        const auto reportPath = qEnvironmentVariable("LISTENFREE_CATALOG_BENCH_REPORT");
+        if (!reportPath.isEmpty()) {
+            QFile report(reportPath);
+            QVERIFY(report.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            report.write(QJsonDocument(metrics).toJson());
+        }
+        qInfo().noquote() << QJsonDocument(metrics).toJson(QJsonDocument::Compact);
+    }
+
     void sourceReconnectWaitsForSlowShutdown() {
         qputenv("LISTENFREE_FAULT_MODE", "ignore-stop");
         qmlbridge::SourceController source(nullptr,
@@ -90,6 +463,24 @@ private slots:
         QCOMPARE(player.currentTrackId(),QString("kw:465071414"));
         QCOMPARE(player.currentQueueIndex(),1);
         QVERIFY(!notices.isEmpty());
+        player.stop();
+    }
+
+    void positionTicksOnlyNotifyProgressBindings() {
+        infrastructure::database::Database db;
+        const auto path=temporary_.filePath("progress-notify.sqlite");
+        QVERIFY(db.open(path));QVERIFY(db.migrate());
+        infrastructure::database::SettingsRepository repo(db);
+        qmlbridge::SourceController source(&repo);
+        qmlbridge::PortableSession player(db,path,source);
+        player.playAll({local(mp3_)});
+        QTRY_VERIFY_WITH_TIMEOUT(player.state()=="Playing" && player.position()>250,8000);
+        QSignalSpy progress(&player,&qmlbridge::PortableSession::progressChanged);
+        QSignalSpy broad(&player,&qmlbridge::PortableSession::changed);
+        const auto before=player.position();
+        QTRY_VERIFY_WITH_TIMEOUT(player.position()>before+600,3000);
+        QVERIFY(progress.size()>=2);
+        QCOMPARE(broad.size(),0);
         player.stop();
     }
 
@@ -223,10 +614,13 @@ private slots:
         }
         infrastructure::database::SettingsRepository repo(db);qmlbridge::SourceController source(&repo);
         qmlbridge::PortableSession player(db,dbPath,source);QTRY_VERIFY(player.ready());
-        CoverImageProvider covers;
+        CoverImageProvider covers(player.collectionCoverIndex());
         for(const auto& collection:{player.albums(),player.artists()}){
             QCOMPARE(collection.size(),1);
             const auto url=collection.front().toMap().value("artwork").toString();
+            QVERIFY(url.startsWith("image://covers/collection-index/"));
+            QVERIFY2(url.size()<128,"A collection URL must not retain all candidate file paths");
+            QCOMPARE(player.collectionCoverIndex()->candidates(url.mid(15)).size(),2);
             const auto image=covers.requestImage(url.mid(QString("image://covers/").size()),nullptr,QSize(64,64));
             QVERIFY2(image.width()>1,"A collection must find artwork in another song when its representative has none");
             QCOMPARE(image.pixelColor(image.width()/2,image.height()/2),QColor("#da3020"));
@@ -243,7 +637,100 @@ private slots:
             QCOMPARE(thumbnail.size(),actual);
             QCOMPARE(thumbnail.pixelColor(8,4),QColor("#da3020"));
             QCOMPARE(covers.requestImage(url.mid(15),nullptr,QSize(0,8)).size(),QSize(16,8));
+            // Saved image URLs from before the index migration remain readable.
+            QJsonArray legacyCandidates;
+            for (int i=1;i>=0;--i) legacyCandidates.append(player.songs().at(i).toMap().value("artwork").toString().mid(15));
+            const auto legacy=QStringLiteral("collection/")+QString::fromLatin1(
+                QJsonDocument(legacyCandidates).toJson(QJsonDocument::Compact).toBase64(
+                    QByteArray::Base64UrlEncoding|QByteArray::OmitTrailingEquals));
+            QCOMPARE(covers.requestImage(legacy,nullptr,QSize(64,64)).pixelColor(32,16),QColor("#da3020"));
         }
+    }
+    void collectionArtworkIndexInvalidatesOnMembershipAndFileChange() {
+        QTemporaryDir mediaDir;QVERIFY(mediaDir.isValid());
+        infrastructure::database::Database db;const auto dbPath=mediaDir.filePath("library.sqlite");
+        QVERIFY(db.open(dbPath));QVERIFY(db.migrate());QVERIFY(db.setSetting("library.metadataRelationsVersion","1"));
+        const auto writeCover=[&](const QString& path,const QColor& color,int width) {
+            QImage image(width,32,QImage::Format_RGB32);image.fill(color);
+            QByteArray picture;QBuffer buffer(&picture);if(!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer,"PNG"))return false;
+            TagLib::MPEG::File file(path.toStdWString().c_str(),false);if(!file.isValid())return false;
+            auto* tag=file.ID3v2Tag(true);tag->removeFrames("APIC");
+            auto* frame=new TagLib::ID3v2::AttachedPictureFrame;
+            frame->setType(TagLib::ID3v2::AttachedPictureFrame::FrontCover);frame->setMimeType("image/png");
+            frame->setPicture(TagLib::ByteVector(picture.constData(),picture.size()));tag->addFrame(frame);
+            return file.save();
+        };
+        const auto insert=[&](int number,bool cover,const QColor& color=QColor("#da3020")) {
+            const auto path=mediaDir.filePath(QString::number(number)+".mp3");
+            if(!QFile::copy(mp3_,path))return false;
+            if(cover) { if(!writeCover(path,color,64))return false; }
+            else {
+                TagLib::MPEG::File file(path.toStdWString().c_str(),false);if(!file.isValid())return false;
+                file.ID3v2Tag(true)->removeFrames("APIC");if(!file.save())return false;
+            }
+            domain::Track track;track.id=domain::TrackId(path.toStdString());track.localPath=path.toStdString();
+            track.title=QString::number(number).toStdString();track.artists={{"artist","Artist"}};
+            track.album=domain::Album{"album","Album",std::nullopt};
+            return db.upsertTrack(track);
+        };
+        QVERIFY(insert(0,true));QVERIFY(insert(1,false));
+        infrastructure::database::SettingsRepository repo(db);qmlbridge::SourceController source(&repo);
+        qmlbridge::PortableSession player(db,dbPath,source);QTRY_VERIFY_WITH_TIMEOUT(player.ready(),8000);
+        CoverImageProvider covers(player.collectionCoverIndex());
+        const auto albumUrl=[&] {return player.albums().first().toMap().value("artwork").toString();};
+        const auto colorAt=[&](const QString& url) {
+            const auto image=covers.requestImage(url.mid(15),nullptr,QSize(64,64));
+            return image.pixelColor(image.width()/2,image.height()/2);
+        };
+        const auto initial=albumUrl();
+        QVERIFY(initial.startsWith("image://covers/collection-index/"));
+        QCOMPARE(colorAt(initial),QColor("#da3020"));
+        // Exercise the actual QML Image URL path, including provider ID parsing.
+        {
+            QQmlEngine engine;
+            engine.addImageProvider("covers",new CoverImageProvider(player.collectionCoverIndex()));
+            QQmlComponent component(&engine);
+            component.setData(QByteArray("import QtQuick\nImage { asynchronous: true; source: '")
+                +initial.toUtf8()+QByteArray("' }"),QUrl());
+            std::unique_ptr<QObject> image(component.create());
+            QVERIFY2(image,qPrintable(component.errorString()));
+            QTRY_COMPARE_WITH_TIMEOUT(image->property("status").toInt(),1,8000);
+            QVERIFY2(image->property("implicitWidth").toDouble()>1,
+                     "QML Image must resolve the indexed group to real artwork");
+        }
+
+        QSignalSpy published(&player,&qmlbridge::PortableSession::catalogChanged);
+        QVERIFY(insert(2,true,QColor("#2040da")));
+        player.reloadCatalogChanges();QTRY_COMPARE_WITH_TIMEOUT(published.size(),1,8000);
+        const auto added=albumUrl();QVERIFY(added!=initial);
+        QCOMPARE(colorAt(added),QColor("#2040da"));
+        QCOMPARE(colorAt(initial),QColor("#2040da"));
+
+        const auto newest=mediaDir.filePath("2.mp3");
+        QVERIFY(writeCover(newest,QColor("#20a050"),80));
+        published.clear();player.reload();QTRY_COMPARE_WITH_TIMEOUT(published.size(),1,8000);
+        const auto changed=albumUrl();QVERIFY(changed!=added);
+        QCOMPARE(colorAt(changed),QColor("#20a050"));
+        QCOMPARE(colorAt(added),QColor("#20a050"));
+
+        QVERIFY(db.removeTrack(newest));
+        published.clear();player.reloadCatalogChanges();QTRY_COMPARE_WITH_TIMEOUT(published.size(),1,8000);
+        const auto removed=albumUrl();QVERIFY(removed!=changed);
+        QCOMPARE(colorAt(removed),QColor("#da3020"));
+        QCOMPARE(colorAt(changed),QColor("#da3020"));
+
+        QVERIFY(db.removeTrack(mediaDir.filePath("1.mp3")));
+        published.clear();player.reloadCatalogChanges();QTRY_COMPARE_WITH_TIMEOUT(published.size(),1,8000);
+        const auto single=albumUrl();QVERIFY(single.startsWith("image://covers/"));
+        QVERIFY(!single.startsWith("image://covers/collection-index/"));
+        QCOMPARE(colorAt(single),QColor("#da3020"));
+        QCOMPARE(colorAt(changed),QColor("#da3020"));
+        QCOMPARE(player.collectionCoverIndex()->candidates(changed.mid(15)).size(),1);
+
+        QVERIFY(db.removeTrack(mediaDir.filePath("0.mp3")));
+        published.clear();player.reloadCatalogChanges();QTRY_COMPARE_WITH_TIMEOUT(published.size(),1,8000);
+        QVERIFY(player.albums().isEmpty());
+        QVERIFY(player.collectionCoverIndex()->candidates(changed.mid(15)).isEmpty());
     }
     void localMediaContentDetection_data() {
         QTest::addColumn<bool>("reported");
@@ -1365,6 +1852,143 @@ private slots:
             QVERIFY(player.state() != "Playing");
             player.clearQueue(); QCOMPARE(player.queueSongs().size(), 0);
         }
+    }
+
+    void ordinaryQueueAppendKeepsModelRows() {
+        infrastructure::database::Database db;
+        const auto path = temporary_.filePath("queue-append.sqlite");
+        QVERIFY(db.open(path));
+        QVERIFY(db.migrate());
+        infrastructure::database::SettingsRepository repo(db);
+        qmlbridge::SourceController source(&repo);
+        qmlbridge::PortableSession player(db, path, source);
+        auto* model = player.queueModel();
+        QSignalSpy inserted(model, &QAbstractItemModel::rowsInserted);
+        QSignalSpy reset(model, &QAbstractItemModel::modelReset);
+        QSignalSpy changed(&player, &qmlbridge::PortableSession::queueContentsChanged);
+
+        QVERIFY(player.enqueueTrack(local(mp3_)));
+        QCOMPARE(inserted.size(), 1);
+        QCOMPARE(inserted.at(0).at(1).toInt(), 0);
+        QCOMPARE(reset.size(), 0);
+        QCOMPARE(model->snapshotRows(), player.queueSongs());
+
+        QVERIFY(player.enqueueTrack(local(flac_)));
+        QCOMPARE(inserted.size(), 2);
+        QCOMPARE(inserted.at(1).at(1).toInt(), 1);
+        QCOMPARE(reset.size(), 0);
+        QCOMPARE(model->snapshotRows(), player.queueSongs());
+        QCOMPARE(changed.size(), 2);
+
+        QVERIFY(player.enqueueTrack(local(flac_)));
+        QCOMPARE(inserted.size(), 2);
+        QCOMPARE(changed.size(), 2);
+        QVERIFY(player.enqueueTrack(local(third_), true));
+        QCOMPARE(model->snapshotRows(), player.queueSongs());
+        QCOMPARE(model->rowCount(), 3);
+    }
+
+    void ordinaryQueueMoveKeepsModelRowsAndCurrentTrack() {
+        infrastructure::database::Database db;
+        const auto path = temporary_.filePath("queue-move.sqlite");
+        QVERIFY(db.open(path));
+        QVERIFY(db.migrate());
+        infrastructure::database::SettingsRepository repo(db);
+        qmlbridge::SourceController source(&repo);
+        qmlbridge::PortableSession player(db, path, source);
+        QVERIFY(player.enqueueTrack(local(mp3_)));
+        QVERIFY(player.enqueueTrack(local(flac_)));
+        QVERIFY(player.enqueueTrack(local(third_)));
+        QVERIFY(player.selectQueue(0, false));
+        const auto currentEntryId = player.currentTrack().value("entryId");
+        auto* model = player.queueModel();
+        QPersistentModelIndex persistentFirst(model->index(0, 0));
+        QSignalSpy moved(model, &QAbstractItemModel::rowsMoved);
+        QSignalSpy reset(model, &QAbstractItemModel::modelReset);
+        QSignalSpy contents(&player, &qmlbridge::PortableSession::queueContentsChanged);
+        QSignalSpy changed(&player, &qmlbridge::PortableSession::queueChanged);
+
+        QVERIFY(player.moveQueue(0, 2));
+        QCOMPARE(moved.size(), 1);
+        QCOMPARE(moved.at(0).at(1).toInt(), 0);
+        QCOMPARE(moved.at(0).at(4).toInt(), 3);
+        QCOMPARE(reset.size(), 0);
+        QCOMPARE(contents.size(), 1);
+        QCOMPARE(changed.size(), 1);
+        QCOMPARE(persistentFirst.row(), 2);
+        QCOMPARE(player.currentQueueIndex(), 2);
+        QCOMPARE(model->currentIndex(), 2);
+        QCOMPARE(player.currentTrack().value("entryId"), currentEntryId);
+        QCOMPARE(model->snapshotRows(), player.queueSongs());
+
+        QVERIFY(player.moveQueue(2, 0));
+        QCOMPARE(moved.size(), 2);
+        QCOMPARE(moved.at(1).at(1).toInt(), 2);
+        QCOMPARE(moved.at(1).at(4).toInt(), 0);
+        QCOMPARE(reset.size(), 0);
+        QCOMPARE(contents.size(), 2);
+        QCOMPARE(changed.size(), 2);
+        QCOMPARE(persistentFirst.row(), 0);
+        QCOMPARE(player.currentQueueIndex(), 0);
+        QCOMPARE(model->currentIndex(), 0);
+        QCOMPARE(model->snapshotRows(), player.queueSongs());
+
+        // Same-position moves still persist and notify the queue state.
+        QVERIFY(player.moveQueue(0, 0));
+        QCOMPARE(moved.size(), 2);
+        QCOMPARE(reset.size(), 0);
+        QCOMPARE(contents.size(), 2);
+        QCOMPARE(changed.size(), 3);
+        QVERIFY(!player.moveQueue(-1, 0));
+        QCOMPARE(changed.size(), 3);
+        const auto saved = QJsonDocument::fromJson(QByteArray::fromStdString(
+            db.getSetting("portable.queue").value_or("{}"))).object();
+        QCOMPARE(saved.value("index").toInt(), 0);
+        QCOMPARE(saved.value("items").toArray().at(0).toObject().value("entryId").toString(),
+                 currentEntryId.toString());
+
+        // An unexpected model state falls back to a complete synchronization.
+        model->setRows({});
+        QCOMPARE(model->rowCount(), 0);
+        QVERIFY(player.moveQueue(0, 1));
+        QCOMPARE(moved.size(), 2);
+        QCOMPARE(reset.size(), 2); // deliberate disturbance plus fallback
+        QCOMPARE(model->snapshotRows(), player.queueSongs());
+        QCOMPARE(model->currentIndex(), player.currentQueueIndex());
+    }
+
+    void replacingQueueUsesVisibleListAndSelectedSong() {
+        infrastructure::database::Database db;
+        const auto path = temporary_.filePath("play-action.sqlite");
+        QVERIFY(db.open(path)); QVERIFY(db.migrate());
+        infrastructure::database::SettingsRepository repo(db);
+        qmlbridge::SettingsController settings(repo);
+        settings.setValue("playback.playActionBehavior", "ReplaceCurrentList");
+        QCOMPARE(settings.value("playback.playActionBehavior").toString(), QString("ReplaceCurrentList"));
+        QCOMPARE(db.getSetting("playback.playActionBehavior").value_or(""), std::string("ReplaceCurrentList"));
+
+        qmlbridge::SourceController source(&repo);
+        qmlbridge::PortableSession player(db, path, source);
+        QVERIFY(player.enqueueTrack(local(third_)));
+        const QVariantList visible{local(mp3_), local(flac_), local(mp3_)};
+        QVERIFY(player.replaceQueueWithList(visible, local(flac_)));
+        QCOMPARE(player.queueSongs().size(), 2); // The source list uses normal queue deduplication.
+        QCOMPARE(player.queueSongs()[0].toMap().value("localPath").toString(), mp3_);
+        QCOMPARE(player.queueSongs()[1].toMap().value("localPath").toString(), flac_);
+        QCOMPARE(player.currentQueueIndex(), 1);
+        QCOMPARE(player.currentTrack().value("localPath").toString(), flac_);
+
+        // Repeated appearances of one song map to the queue's first identity.
+        QVERIFY(player.replaceQueueWithList(visible, local(mp3_)));
+        QCOMPARE(player.queueSongs().size(), 2);
+        QCOMPARE(player.currentQueueIndex(), 0);
+
+        // An explicit queue action keeps the replacement list and adds only its song.
+        QVERIFY(player.enqueueTrack(local(third_)));
+        QCOMPARE(player.queueSongs().size(), 3);
+        QVERIFY(!player.replaceQueueWithList({local(mp3_)}, local(third_)));
+        QCOMPARE(player.queueSongs().size(), 3); // Stale or mismatched context cannot erase it.
+        player.stop();
     }
 
 

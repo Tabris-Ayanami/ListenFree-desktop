@@ -1373,7 +1373,7 @@ QtObject {
             if(++state->flowWait<5){--state->phase;return;}
             capture("playlists-dark");
             state->checks["miniplayer_transparent"]=item("floatingPlayer")->property("backdrop").value<QQuickItem*>()!=nullptr;
-            state->checks["theme_selected_feedback"]=item("topThemeButton")->property("selected").toBool()&&shell->property("darkMode").toBool();
+            state->checks["theme_button_has_no_selected_ring"]=!item("topThemeButton")->property("selected").toBool()&&shell->property("darkMode").toBool();
             shell->setProperty("currentRoute","library/artists");return;
         case 156: {
             if(++state->flowWait<8){--state->phase;return;}

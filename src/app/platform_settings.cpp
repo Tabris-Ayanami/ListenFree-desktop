@@ -365,7 +365,7 @@ void PlatformSettings::action(const QString &key) {
         QMessageBox::Yes)
       return;
     if (db_.clearLibraryIndex()) {
-      player_.reload();
+      player_.reloadCatalogChanges();
       emit player_.notice(tr("资料库索引已清空"));
     }
     return;

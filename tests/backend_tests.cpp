@@ -6,6 +6,7 @@
 #include "media/qt_audio_player.h"
 #include "online/mock_online_provider.h"
 #include "qmlbridge/controllers.h"
+#include "qmlbridge/list_models.h"
 #include "sourcehost/source_protocol.h"
 #include "sourcehost/sourcehost_client.h"
 
@@ -74,10 +75,29 @@ public:
     std::optional<listenfree::domain::Track> find(const listenfree::domain::TrackId&) override {
         return std::nullopt;
     }
-    std::vector<listenfree::domain::Track> search(const std::string&) override { return {}; }
+    std::vector<listenfree::domain::Track> search(const std::string&) override {
+        ++searchCalls;
+        return {};
+    }
+    std::uint64_t count() override { return trackCount; }
     std::vector<listenfree::application::LocalFileFingerprint> localFiles() override {
         throw std::runtime_error("fingerprint-load-failed");
     }
+
+    std::uint64_t trackCount{0};
+    int searchCalls{0};
+};
+
+class PendingLibraryScanner final : public listenfree::application::ILocalLibraryScanner {
+public:
+    listenfree::application::ScanId start(const listenfree::application::ScanRequest&,
+                                          listenfree::application::ScanCallbacks) override {
+        return ++scanId;
+    }
+    void cancel(listenfree::application::ScanId) noexcept override {}
+
+private:
+    listenfree::application::ScanId scanId{0};
 };
 
 class BackendTests final : public QObject {
@@ -95,6 +115,10 @@ private slots:
     void databaseUpgradesShippedDuplicateAliasSchema();
     void databasePortRepositories();
     void databaseTrackRelationsRoundTrip();
+    void databaseStreamedTracksMatchLoadTracks();
+    void databaseCatalogJournalPreservesCommittedProjection();
+    void databaseCatalogJournalBoundsCumulativeChanges();
+    void databaseCatalogJournalBoundsRelationRepairs();
     void metadataReaderMapsRegularFile();
     void metadataReaderAcceptsEmptyRegularFile();
     void metadataReaderRejectsMissingFile();
@@ -109,6 +133,8 @@ private slots:
     void libraryControllerContainsFingerprintFailure();
     void libraryControllerSkipsUnchangedSizeAndMtime();
     void libraryControllerPersistsAndUsesFolders();
+    void libraryControllerUsesCountWithoutTrackHydration();
+    void libraryControllerActiveRootRemovalReloadsOnce();
     void libraryAutoWatchFindsSettledFilesAndHonorsSwitch();
     void libraryAutoWatchWaitsForManualScan();
     void libraryAutoWatchRemovesMissingFilesAndSubtrees();
@@ -134,6 +160,7 @@ private slots:
     void sourceHostBoundsPendingRequests();
     void mockProvider();
     void listModels();
+    void filteredTrackModelPreservesRowsAndUpdates();
     void appControllerMock();
 };
 
@@ -387,6 +414,7 @@ void BackendTests::databasePortRepositories() {
     second.title = "Another Song";
     const std::array batch{first, second};
     QVERIFY(tracks.upsert(batch));
+    QCOMPARE(tracks.count(), std::uint64_t(2));
     QVERIFY(tracks.find(first.id).has_value());
     QCOMPARE(tracks.search("Repository").size(), std::size_t(1));
 
@@ -397,7 +425,14 @@ void BackendTests::databasePortRepositories() {
     invalidCandidate.title = "Missing identifier";
     const std::array atomicBatch{atomicCandidate, invalidCandidate};
     QVERIFY(!tracks.upsert(atomicBatch));
+    QCOMPARE(tracks.count(), std::uint64_t(2));
     QVERIFY(!tracks.find(atomicCandidate.id).has_value());
+
+    first.title = "Renamed Repository Song";
+    QVERIFY(tracks.upsert(std::span<const listenfree::domain::Track>(&first, 1)));
+    QCOMPARE(tracks.count(), std::uint64_t(2));
+    QVERIFY(database.removeTrack(QStringLiteral("repo-2")));
+    QCOMPARE(tracks.count(), std::uint64_t(1));
 
     QVERIFY(history.record(first.id, std::chrono::system_clock::now()));
     QVERIFY(!history.record(listenfree::domain::TrackId("missing-history-track"),
@@ -423,6 +458,8 @@ void BackendTests::databasePortRepositories() {
     invalid.entries.push_back({"entry-invalid", listenfree::domain::TrackId("missing-track"), 0});
     QVERIFY(!playlists.save(invalid));
     QVERIFY(playlists.list().empty());
+    QVERIFY(database.clearLibraryIndex());
+    QCOMPARE(tracks.count(), std::uint64_t(0));
 }
 
 void BackendTests::databaseTrackRelationsRoundTrip() {
@@ -454,6 +491,333 @@ void BackendTests::databaseTrackRelationsRoundTrip() {
     QVERIFY(replaced.has_value());
     QCOMPARE(replaced->artists, track.artists);
     QVERIFY(!replaced->album.has_value());
+}
+
+void BackendTests::databaseStreamedTracksMatchLoadTracks() {
+    using listenfree::domain::Album;
+    using listenfree::domain::Track;
+    using listenfree::domain::TrackId;
+    using listenfree::infrastructure::database::Database;
+
+    QTemporaryDir temp;
+    QVERIFY(temp.isValid());
+    Database database;
+    QVERIFY(database.open(temp.filePath(QStringLiteral("streamed-tracks.sqlite"))));
+    int visits = 0;
+    QVERIFY(database.forEachTrack([&](Track&&) { ++visits; }));
+    QCOMPARE(visits, 0);
+
+    Track tieLocal;
+    tieLocal.id = TrackId("z-local");
+    tieLocal.title = "Same Title";
+    tieLocal.duration = std::chrono::milliseconds(123'456);
+    tieLocal.localPath = "C:/music/same.flac";
+    // IDs sort oppositely to ordinals, exposing accidental artist ID order.
+    tieLocal.artists = {{"z-first", "First Artist"}, {"a-second", "Second Artist"}};
+    tieLocal.album = Album{"album-local", "Local Album", std::nullopt};
+
+    Track tieRemote;
+    tieRemote.id = TrackId("a-remote");
+    tieRemote.title = "Same Title";
+    tieRemote.duration = std::chrono::milliseconds(9'876);
+    tieRemote.remoteUrl = "https://example.invalid/audio?id=1";
+    tieRemote.album = Album{"album-remote", "Remote Album",
+                            std::string("https://example.invalid/art.jpg")};
+
+    Track first;
+    first.id = TrackId("first");
+    first.title = "A First";
+    // No artists, album, or source: the LEFT JOIN must still visit it.
+
+    Track last;
+    last.id = TrackId("last");
+    last.title = "Z Last";
+    last.artists = {{"only-artist", "Only Artist"}};
+
+    const std::array tracks{tieLocal, tieRemote, first, last};
+    QVERIFY(database.upsertTracks(tracks));
+    const auto loaded = database.loadTracks();
+    std::vector<Track> streamed;
+    QVERIFY(database.forEachTrack([&](Track&& track) { streamed.push_back(std::move(track)); }));
+    QCOMPARE(streamed.size(), loaded.size());
+    QCOMPARE(streamed.size(), std::size_t(4));
+    QCOMPARE(streamed[0].id.value(), std::string("first"));
+    QCOMPARE(streamed[1].id.value(), std::string("z-local"));
+    QCOMPARE(streamed[2].id.value(), std::string("a-remote"));
+    QCOMPARE(streamed[3].id.value(), std::string("last"));
+    for (std::size_t i = 0; i < loaded.size(); ++i) {
+        QCOMPARE(streamed[i].id.value(), loaded[i].id.value());
+        QCOMPARE(streamed[i].title, loaded[i].title);
+        QCOMPARE(streamed[i].artists, loaded[i].artists);
+        QCOMPARE(streamed[i].album, loaded[i].album);
+        QVERIFY(streamed[i].duration == loaded[i].duration);
+        QVERIFY(streamed[i].localPath == loaded[i].localPath);
+        QVERIFY(streamed[i].remoteUrl == loaded[i].remoteUrl);
+    }
+
+    database.close();
+    QVERIFY(!database.forEachTrack([&](Track&&) { ++visits; }));
+    QCOMPARE(visits, 0);
+}
+
+void BackendTests::databaseCatalogJournalPreservesCommittedProjection() {
+    using listenfree::domain::Track;
+    using listenfree::domain::TrackId;
+    using listenfree::infrastructure::database::CatalogDelta;
+    using listenfree::infrastructure::database::CatalogSnapshotState;
+    using listenfree::infrastructure::database::Database;
+
+    QTemporaryDir temp;
+    QVERIFY(temp.isValid());
+    Database database;
+    QVERIFY(database.open(temp.filePath(QStringLiteral("catalog-journal.sqlite"))));
+    CatalogSnapshotState state;
+    QVERIFY(database.forEachTrackWithRevision([](Track&&) {}, state));
+    const auto emptyRevision = state.revision;
+    const auto makeTrack = [](const char* id, const char* name) {
+        Track track;
+        track.id = TrackId(id);
+        track.title = id;
+        track.remoteUrl = std::string("https://example.invalid/") + id;
+        track.artists = {{"shared", name}};
+        track.album = listenfree::domain::Album{"shared-album", "Shared Album", std::nullopt};
+        return track;
+    };
+    QVERIFY(database.upsertTrack(makeTrack("a", "Old Name")));
+    QVERIFY(database.upsertTrack(makeTrack("b", "Old Name")));
+    CatalogDelta delta;
+    QVERIFY(database.readCatalogDelta(emptyRevision, 256, delta));
+    QVERIFY(!delta.requiresFullReload);
+    QCOMPARE(delta.changes.size(), std::size_t(2));
+    const auto beforeInvalid = delta.state.revision;
+    QVERIFY(!database.upsertTrack(Track{}));
+    QVERIFY(database.readCatalogDelta(beforeInvalid, 256, delta));
+    QCOMPARE(delta.state.revision, beforeInvalid);
+    QVERIFY(delta.changes.empty());
+
+    QVERIFY(database.upsertTrack(makeTrack("a", "New Name")));
+    QVERIFY(database.readCatalogDelta(beforeInvalid, 256, delta));
+    QVERIFY(!delta.requiresFullReload);
+    QCOMPARE(delta.changes.size(), std::size_t(2));
+    QSet<QString> affected;
+    for (const auto& change : delta.changes) {
+        affected.insert(QString::fromStdString(change.trackId));
+        QVERIFY(change.track.has_value());
+        QCOMPARE(change.track->artists.front().name, std::string("New Name"));
+    }
+    QCOMPARE(affected, (QSet<QString>{QStringLiteral("a"), QStringLiteral("b")}));
+
+    const auto beforeDelete = delta.state.revision;
+    QVERIFY(database.removeTrack(QStringLiteral("b")));
+    QVERIFY(database.readCatalogDelta(beforeDelete, 256, delta));
+    QCOMPARE(delta.changes.size(), std::size_t(1));
+    QCOMPARE(delta.changes.front().trackId, std::string("b"));
+    QVERIFY(!delta.changes.front().track.has_value());
+    const auto beforeReadd = delta.state.revision;
+    QVERIFY(database.upsertTrack(makeTrack("b", "New Name")));
+    QVERIFY(database.readCatalogDelta(beforeReadd, 256, delta));
+    QCOMPARE(delta.changes.size(), std::size_t(1));
+    QVERIFY(delta.changes.front().track.has_value());
+
+    const auto beforeClear = delta.state.revision;
+    QVERIFY(database.clearLibraryIndex());
+    QVERIFY(database.readCatalogDelta(beforeClear, 256, delta));
+    QVERIFY(delta.requiresFullReload);
+    const auto afterClear = delta.state.revision;
+    std::vector<Track> largeBatch;
+    largeBatch.reserve(300);
+    for (int i = 0; i < 300; ++i) {
+        Track track;
+        track.id = TrackId(QStringLiteral("batch-%1").arg(i).toStdString());
+        track.title = "Batch";
+        largeBatch.push_back(std::move(track));
+    }
+    QVERIFY(database.upsertTracks(largeBatch));
+    QVERIFY(database.readCatalogDelta(afterClear, 256, delta));
+    QVERIFY(delta.requiresFullReload);
+    QCOMPARE(database.trackCount(), std::uint64_t(300));
+
+    // A shared rename can affect more rows than the incoming upsert batch.
+    // It should invalidate the snapshot without persisting hundreds of IDs.
+    QVERIFY(database.clearLibraryIndex());
+    largeBatch.clear();
+    for (int i = 0; i < 300; ++i) {
+        Track track;
+        track.id = TrackId(QStringLiteral("shared-%1").arg(i).toStdString());
+        track.title = "Shared";
+        track.artists = {{"all", "Old"}};
+        largeBatch.push_back(std::move(track));
+    }
+    QVERIFY(database.upsertTracks(largeBatch));
+    QVERIFY(database.forEachTrackWithRevision([](Track&&) {}, state));
+    auto renamed = largeBatch.front();
+    renamed.artists.front().name = "New";
+    QVERIFY(database.upsertTrack(renamed));
+    QVERIFY(database.readCatalogDelta(state.revision, 256, delta));
+    QVERIFY(delta.requiresFullReload);
+    const auto afterSharedReset = delta.state.revision;
+    renamed.duration += std::chrono::milliseconds(1000);
+    QVERIFY(database.upsertTrack(renamed));
+    QVERIFY(database.readCatalogDelta(afterSharedReset, 256, delta));
+    QVERIFY(!delta.requiresFullReload);
+    QCOMPARE(delta.changes.size(), std::size_t(1));
+
+    QVERIFY(database.clearLibraryIndex());
+    largeBatch.clear();
+    for (int i = 0; i < 300; ++i) {
+        Track track;
+        track.id = TrackId(QStringLiteral("album-%1").arg(i).toStdString());
+        track.title = "Shared Album Track";
+        track.album = listenfree::domain::Album{"album-all", "Old Album", std::nullopt};
+        largeBatch.push_back(std::move(track));
+    }
+    QVERIFY(database.upsertTracks(largeBatch));
+    QVERIFY(database.forEachTrackWithRevision([](Track&&) {}, state));
+    auto renamedAlbum = largeBatch.front();
+    renamedAlbum.album->title = "New Album";
+    QVERIFY(database.upsertTrack(renamedAlbum));
+    QVERIFY(database.readCatalogDelta(state.revision, 256, delta));
+    QVERIFY(delta.requiresFullReload);
+}
+
+void BackendTests::databaseCatalogJournalBoundsCumulativeChanges() {
+    using listenfree::domain::Track;
+    using listenfree::domain::TrackId;
+    using listenfree::infrastructure::database::CatalogDelta;
+    using listenfree::infrastructure::database::CatalogSnapshotState;
+    using listenfree::infrastructure::database::Database;
+
+    QTemporaryDir temp;
+    QVERIFY(temp.isValid());
+    const QString path = temp.filePath(QStringLiteral("catalog-bound.sqlite"));
+    Database database;
+    QVERIFY(database.open(path));
+    QSqlDatabase probe = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
+                                                   QStringLiteral("catalog-bound-probe"));
+    probe.setDatabaseName(path);
+    QVERIFY(probe.open());
+    const auto journalSize = [&]() -> qlonglong {
+        QSqlQuery count(probe);
+        if (!count.exec(QStringLiteral("SELECT COUNT(*) FROM catalog_changes")) || !count.next())
+            return -1;
+        return count.value(0).toLongLong();
+    };
+    const auto makeTrack = [](int number) {
+        Track track;
+        track.id = TrackId(QStringLiteral("bounded-%1").arg(number).toStdString());
+        track.title = "Bounded";
+        return track;
+    };
+    CatalogSnapshotState initial;
+    QVERIFY(database.forEachTrackWithRevision([](Track&&) {}, initial));
+
+    // Scanner-sized transactions must not accumulate an unbounded persistent
+    // journal even though no individual batch exceeds the sparse limit.
+    for (int batchIndex = 0; batchIndex < 64; ++batchIndex) {
+        std::vector<Track> batch;
+        batch.reserve(64);
+        for (int row = 0; row < 64; ++row) batch.push_back(makeTrack(batchIndex * 64 + row));
+        QVERIFY(database.upsertTracks(batch));
+    }
+    CatalogSnapshotState atLimit;
+    QVERIFY(database.forEachTrackWithRevision([](Track&&) {}, atLimit));
+    QCOMPARE(atLimit.resetRevision, initial.resetRevision);
+    QCOMPARE(journalSize(), qlonglong(4096));
+
+    std::vector<Track> overflowBatch;
+    overflowBatch.reserve(64);
+    for (int row = 0; row < 64; ++row) overflowBatch.push_back(makeTrack(4096 + row));
+    QVERIFY(database.upsertTracks(overflowBatch));
+    CatalogDelta delta;
+    QVERIFY(database.readCatalogDelta(atLimit.revision, 256, delta));
+    QVERIFY(delta.requiresFullReload);
+    QCOMPARE(delta.state.resetRevision, delta.state.revision);
+    QCOMPARE(journalSize(), qlonglong(0));
+
+    auto oneEdit = makeTrack(0);
+    oneEdit.duration = std::chrono::milliseconds(1234);
+    const auto afterReset = delta.state.revision;
+    QVERIFY(database.upsertTrack(oneEdit));
+    QVERIFY(database.readCatalogDelta(afterReset, 256, delta));
+    QVERIFY(!delta.requiresFullReload);
+    QCOMPARE(delta.changes.size(), std::size_t(1));
+    QCOMPARE(delta.changes.front().trackId, std::string("bounded-0"));
+    QCOMPARE(journalSize(), qlonglong(1));
+
+    // A failure after a valid row must roll back both the projection and its
+    // journal revision rather than publishing an incomplete delta.
+    const auto beforeFailure = delta.state.revision;
+    std::vector<Track> invalidBatch{makeTrack(5000), Track{}};
+    QVERIFY(!database.upsertTracks(invalidBatch));
+    QVERIFY(!database.findTrack(TrackId("bounded-5000")).has_value());
+    QVERIFY(database.readCatalogDelta(beforeFailure, 256, delta));
+    QCOMPARE(delta.state.revision, beforeFailure);
+    QVERIFY(delta.changes.empty());
+    QCOMPARE(journalSize(), qlonglong(1));
+
+    QVERIFY(database.clearLibraryIndex());
+    CatalogSnapshotState afterClear;
+    QVERIFY(database.forEachTrackWithRevision([](Track&&) {}, afterClear));
+    QCOMPARE(journalSize(), qlonglong(0));
+    for (int batchIndex = 0; batchIndex < 65; ++batchIndex) {
+        std::vector<Track> sameIds(64, makeTrack(0));
+        QVERIFY(database.upsertTracks(sameIds));
+    }
+    CatalogSnapshotState repeated;
+    QVERIFY(database.forEachTrackWithRevision([](Track&&) {}, repeated));
+    QCOMPARE(repeated.resetRevision, afterClear.revision);
+    QCOMPARE(journalSize(), qlonglong(1));
+    QVERIFY(database.readCatalogDelta(afterClear.revision, 256, delta));
+    QVERIFY(!delta.requiresFullReload);
+    QCOMPARE(delta.changes.size(), std::size_t(1));
+
+    probe.close();
+    probe = QSqlDatabase();
+    QSqlDatabase::removeDatabase(QStringLiteral("catalog-bound-probe"));
+}
+
+void BackendTests::databaseCatalogJournalBoundsRelationRepairs() {
+    using listenfree::domain::Track;
+    using listenfree::domain::TrackId;
+    using listenfree::infrastructure::database::CatalogDelta;
+    using listenfree::infrastructure::database::CatalogSnapshotState;
+    using listenfree::infrastructure::database::Database;
+
+    QTemporaryDir temp;
+    QVERIFY(temp.isValid());
+    Database database;
+    QVERIFY(database.open(temp.filePath(QStringLiteral("catalog-repair-bound.sqlite"))));
+    std::vector<Track> bare;
+    std::vector<Track> repaired;
+    bare.reserve(257);
+    repaired.reserve(257);
+    for (int index = 0; index < 257; ++index) {
+        Track track;
+        track.id = TrackId(QStringLiteral("repair-%1").arg(index).toStdString());
+        track.title = "Repair";
+        bare.push_back(track);
+        track.artists = {{"repair-artist", "Artist"}};
+        track.album = listenfree::domain::Album{"repair-album", "Album", std::nullopt};
+        repaired.push_back(std::move(track));
+    }
+    QVERIFY(database.upsertTracks(bare));
+    CatalogSnapshotState beforeRepair;
+    QVERIFY(database.forEachTrackWithRevision([](Track&&) {}, beforeRepair));
+    QVERIFY(database.restoreMissingRelations(repaired));
+    CatalogDelta delta;
+    QVERIFY(database.readCatalogDelta(beforeRepair.revision, 256, delta));
+    QVERIFY(delta.requiresFullReload);
+    QCOMPARE(delta.state.resetRevision, delta.state.revision);
+    const auto found = database.findTrack(TrackId("repair-256"));
+    QVERIFY(found.has_value());
+    QCOMPARE(found->artists.size(), std::size_t(1));
+    QVERIFY(found->album.has_value());
+
+    const auto afterRepair = delta.state.revision;
+    QVERIFY(database.restoreMissingRelations(repaired));
+    QVERIFY(database.readCatalogDelta(afterRepair, 256, delta));
+    QCOMPARE(delta.state.revision, afterRepair);
+    QVERIFY(delta.changes.empty());
 }
 
 void BackendTests::metadataReaderMapsRegularFile() {
@@ -777,9 +1141,13 @@ void BackendTests::libraryControllerPersistsAndUsesFolders() {
     QCOMPARE(tracks.search("").size(), std::size_t(2));
     QCOMPARE(controller.totalCount(), quint64(2));
 
+    QSignalSpy contentChanged(&controller, &listenfree::qmlbridge::LibraryController::libraryContentChanged);
+    QSignalSpy scanningChanged(&controller, &listenfree::qmlbridge::LibraryController::scanningChanged);
     QVERIFY(controller.removeRoot(root));
     QVERIFY(controller.roots().isEmpty());
     QCOMPARE(controller.totalCount(), quint64(1));
+    QCOMPARE(contentChanged.count(), 1);
+    QCOMPARE(scanningChanged.count(), 0);
     QCOMPARE(tracks.search("unrelated-track").size(), std::size_t(1));
     QCOMPARE(tracks.search("folder-track").size(), std::size_t(0));
     QVERIFY(!controller.removeRoot(root));
@@ -787,6 +1155,45 @@ void BackendTests::libraryControllerPersistsAndUsesFolders() {
     const QString missingRoot = QDir(root).filePath(QStringLiteral("missing"));
     QVERIFY(folders.add(std::filesystem::path(missingRoot.toStdWString())));
     QVERIFY(controller.removeRoot(missingRoot));
+}
+
+void BackendTests::libraryControllerUsesCountWithoutTrackHydration() {
+    PendingLibraryScanner scanner;
+    ThrowingFingerprintRepository tracks;
+    tracks.trackCount = 42;
+    listenfree::qmlbridge::LibraryController controller(scanner, tracks, nullptr);
+    QCOMPARE(controller.totalCount(), quint64(42));
+    QCOMPARE(tracks.searchCalls, 0);
+
+    tracks.trackCount = 43;
+    controller.refreshTotalCount();
+    QCOMPARE(controller.totalCount(), quint64(43));
+    QCOMPARE(tracks.searchCalls, 0);
+}
+
+void BackendTests::libraryControllerActiveRootRemovalReloadsOnce() {
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString root = directory.filePath(QStringLiteral("music"));
+    QVERIFY(QDir().mkpath(root));
+    const QString databasePath = directory.filePath(QStringLiteral("active-removal.sqlite"));
+    listenfree::infrastructure::database::Database database;
+    QVERIFY(database.open(databasePath));
+    listenfree::infrastructure::database::TrackRepository tracks(database);
+    listenfree::infrastructure::database::LibraryFolderRepository folders(database);
+    PendingLibraryScanner scanner;
+    listenfree::qmlbridge::LibraryController controller(scanner, tracks, &folders, databasePath);
+    QSignalSpy contentChanged(&controller, &listenfree::qmlbridge::LibraryController::libraryContentChanged);
+    QSignalSpy scanningChanged(&controller, &listenfree::qmlbridge::LibraryController::scanningChanged);
+
+    QVERIFY(controller.addRoot(root));
+    QVERIFY(controller.scanning());
+    QCOMPARE(scanningChanged.count(), 1);
+    scanningChanged.clear();
+    QVERIFY(controller.removeRoot(root));
+    QVERIFY(!controller.scanning());
+    QCOMPARE(scanningChanged.count(), 1);
+    QCOMPARE(contentChanged.count(), 0);
 }
 
 void BackendTests::libraryAutoWatchFindsSettledFilesAndHonorsSwitch() {
@@ -1771,6 +2178,72 @@ void BackendTests::listModels() {
     QCOMPARE(model.property("count").toInt(), 0);
     QCOMPARE(countChanged.count(), 2);
     QVERIFY(model.get(0).isEmpty());
+}
+
+void BackendTests::filteredTrackModelPreservesRowsAndUpdates() {
+    using listenfree::qmlbridge::FilteredTrackModel;
+    using listenfree::qmlbridge::TrackListModel;
+
+    const QVariantMap first{{"trackId", "first"}, {"title", "Blue Sky"},
+                            {"artist", "North"}, {"album", "Day"},
+                            {"localPath", "C:/music/first.flac"}, {"source", "local"},
+                            {"playbackUrl", "file:///C:/music/first.flac"}};
+    const QVariantMap second{{"trackId", "second"}, {"title", "Night"},
+                             {"artist", "Blue Quartet"}, {"album", "Evening"},
+                             {"source", "remote"}, {"sourceTrackId", "remote-42"}};
+    const QVariantMap third{{"trackId", "third"}, {"title", "Morning"},
+                            {"artist", "South"}, {"album", "Blue Notes"},
+                            {"source", "local"}, {"durationMs", 123456}};
+    TrackListModel source;
+    source.setRows({first, second, third});
+
+    FilteredTrackModel proxy;
+    QSignalSpy countChanged(&proxy, &FilteredTrackModel::countChanged);
+    QCOMPARE(proxy.rowCount(), 0);
+    QVERIFY(proxy.get(0).isEmpty());
+    QVERIFY(proxy.snapshotRows().isEmpty());
+    proxy.setFilterText(QStringLiteral("  BLUE  "));
+    proxy.setSourceTracks(&source);
+    QCOMPARE(proxy.property("count").toInt(), 3);
+    QVERIFY(!countChanged.isEmpty());
+    QCOMPARE(proxy.get(0), first);
+    QCOMPARE(proxy.get(1), second);
+    QCOMPARE(proxy.get(2), third);
+    QCOMPARE(proxy.snapshotRows(), QVariantList({first, second, third}));
+    QCOMPARE(proxy.data(proxy.index(1, 0), TrackListModel::ArtistRole).toString(),
+             QStringLiteral("Blue Quartet"));
+    QVERIFY(proxy.get(-1).isEmpty());
+    QVERIFY(proxy.get(3).isEmpty());
+
+    // Source model order is the displayed and playback order; the proxy does
+    // not allocate a second permanent QVariantList of filtered maps.
+    QVERIFY(source.moveRow(2, 0));
+    QCOMPARE(proxy.snapshotRows(), QVariantList({third, first, second}));
+
+    countChanged.clear();
+    proxy.setFilterText(QStringLiteral(" NIGHT "));
+    QCOMPARE(proxy.property("count").toInt(), 1);
+    QVERIFY(!countChanged.isEmpty());
+    QCOMPARE(proxy.get(0), second);
+    QCOMPARE(proxy.snapshotRows(), QVariantList({second}));
+
+    QVariantMap renamed = first;
+    renamed.insert("title", QStringLiteral("Night Drive"));
+    renamed.insert("sourceTrackId", QStringLiteral("preserved-id"));
+    countChanged.clear();
+    QVERIFY(source.replaceRowsSameOrder({third, renamed, second}, {1}));
+    QCOMPARE(proxy.property("count").toInt(), 2);
+    QVERIFY(!countChanged.isEmpty());
+    QCOMPARE(proxy.snapshotRows(), QVariantList({renamed, second}));
+    QCOMPARE(proxy.get(0).value("sourceTrackId").toString(), QStringLiteral("preserved-id"));
+
+    QVERIFY(source.removeRow(2));
+    QCOMPARE(proxy.property("count").toInt(), 1);
+    QCOMPARE(proxy.get(0), renamed);
+    proxy.setSourceTracks(nullptr);
+    QCOMPARE(proxy.property("count").toInt(), 0);
+    QVERIFY(proxy.get(0).isEmpty());
+    QVERIFY(proxy.snapshotRows().isEmpty());
 }
 
 void BackendTests::appControllerMock() {

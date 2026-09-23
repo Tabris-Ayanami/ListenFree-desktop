@@ -98,6 +98,7 @@
   "刷新网络歌单": "Refresh online playlists",
   "功能尚未接入": "Feature unavailable",
   "加入队尾": "Add to queue",
+  "加入到队列": "Add to queue",
   "加载更多评论": "Load more comments",
   "动态封面": "Animated artwork",
   "动态流转": "Flowing artwork",
@@ -263,6 +264,7 @@
   "播放详情使用动态封面；不可用时显示静态封面。": "Use animated artwork in Now Playing, with a static fallback.",
   "播放详情背景样式": "Now Playing background",
   "播放错误时自动跳过": "Skip playback errors",
+  "切换到当前列表": "Switch to current list",
   "播放队列": "Play queue",
   "播放队列为空": "The queue is empty",
   "操作接口已预留": "This action is not available yet",
@@ -340,6 +342,8 @@
   "歌曲名 - 艺术家": "Title - Artist",
   "歌曲名 / 艺术家 / 专辑": "Track / Artist / Album",
   "歌曲标题 / 艺术家": "Track title / Artist",
+  "歌曲播放行为": "Song play action",
+  "双击歌曲或点击播放时，决定如何使用所在列表。": "Choose how playing a song uses its current list.",
   "歌词": "Lyrics",
   "歌词匹配": "Find lyrics",
   "歌词字号": "Lyric font size",
@@ -624,5 +628,10 @@
   "适用于经典播放器；满溢自动使用封面模糊背景。": "Applies to Classic; Overflow automatically uses blurred artwork.",
   "智能过渡": "Smart transitions",
   "分析近静音尾部并平滑衔接；连续专辑、直播及不兼容格式保留普通播放。": "Analyze near-silent tails and blend tracks; preserve continuous albums, live streams and incompatible formats.",
-  "混音": "Mixing"
+  "混音": "Mixing",
+  "收藏到“我的收藏”": "Save to My Favorites",
+  "新建歌单…": "New playlist…",
+  "新建收藏歌单": "Create favorites playlist",
+  "输入名称，将当前歌曲收藏到新歌单": "Name a new playlist to save this track.",
+  "新建并收藏": "Create and save"
 }

@@ -9,6 +9,9 @@ namespace listenfree::qmlbridge {
 namespace {
 constexpr int naturalOverlap = 6000;
 constexpr int manualOverlap = 4000;
+constexpr int onlineResolutionLead = 25000;
+constexpr int decoderPreparationLead = 10000;
+constexpr int manualResolutionWait = 2500;
 }
 void PortableSession::setSmartTransition(bool enabled) {
     if (!enabled) { resetMixAnalysis(); cancelSmartMix(); }
@@ -37,6 +40,7 @@ void PortableSession::cancelSmartMix() {
     if (rewind && !mixTarget_.isEmpty()) player_.seek(resume);
     const auto resolution=std::exchange(mixResolution_,QString{});
     mixTarget_.clear(); mixManual_=false; mixArmed_=false;
+    mixReadyUrl_.clear(); mixReadyHeaders_.clear();
     if (!resolution.isEmpty()) sources_.cancelResolution(resolution);
     if (mixProxy_) { mixProxy_->cancel(); mixProxy_.reset(); }
     if (hadNotice) emit changed();
@@ -50,7 +54,13 @@ bool PortableSession::prepareSmartMix(int index, bool manual, bool advanceNaviga
     if (mixTarget_==entry) {
         mixAdvance_=advanceNavigation;
         if (mixArmed_) return true; // preserve the already scheduled window and cooldown
-        mixManual_=manual; mixPreparationClock_.start(); emit changed(); return true;
+        mixManual_=manual; mixPreparationClock_.start();
+        if (manual && !mixReadyUrl_.isEmpty()) {
+            const auto url=std::exchange(mixReadyUrl_, QString{});
+            const auto headers=std::exchange(mixReadyHeaders_, QVariantMap{});
+            queueSmartMix(url, headers);
+        }
+        emit changed(); return !mixTarget_.isEmpty();
     }
     cancelSmartMix();
     mixAttempted_=true; mixTarget_=entry; mixIndex_=index; mixManual_=manual; mixAdvance_=advanceNavigation;
@@ -95,9 +105,15 @@ void PortableSession::updateSmartMix() {
     const auto mixEnd=effectiveMixEnd_>0?effectiveMixEnd_:duration();
     if (mixTarget_.isEmpty()) {
         const auto remaining=mixEnd-position();
-        if (!mixAttempted_ && duration()>10000 && remaining<=10000 && duration()-position()>500 &&
-            mode_!="singleLoop" && mode_!="stopAfterCurrent")
-            prepareSmartMix(navigation_.indexOf(navigation_.nextTrack()),false);
+        if (!mixAttempted_ && duration()>10000 && duration()-position()>500 &&
+            mode_!="singleLoop" && mode_!="stopAfterCurrent") {
+            const int next=navigation_.indexOf(navigation_.nextTrack());
+            if (next>=0) {
+                const bool resolvesOnline=!entries_.value(navigation_.track(next)).value("rid").toString().isEmpty();
+                if (remaining <= (resolvesOnline ? onlineResolutionLead : decoderPreparationLead))
+                    prepareSmartMix(next,false);
+            }
+        }
         return;
     }
     const int target=mixTargetIndex();
@@ -106,11 +122,18 @@ void PortableSession::updateSmartMix() {
     const auto elapsed=mixPreparationClock_.elapsed();
     if (mixManual_) {
         if (player_.startPreparedTransition(manualOverlap)) { mixArmed_=true; emit changed(); return; }
-        // Bound the preload readiness retry; ordinary loading remains asynchronous.
-        if (elapsed>=350) {
+        // Address resolution is asynchronous. Keep A audible for a bounded
+        // interval instead of making an ordinary cold switch after 350 ms.
+        if (elapsed>=manualResolutionWait) {
             cancelSmartMix(); navigation_.setCurrent(target); beginCurrent();
         }
         return;
+    }
+    if (!mixReadyUrl_.isEmpty() && mixEnd-position()<=decoderPreparationLead) {
+        const auto url=std::exchange(mixReadyUrl_, QString{});
+        const auto headers=std::exchange(mixReadyHeaders_, QVariantMap{});
+        queueSmartMix(url, headers);
+        if (mixTarget_.isEmpty()) return;
     }
     const auto next=entries_.value(navigation_.track(target));
     const auto current=currentTrack();
@@ -125,7 +148,8 @@ void PortableSession::updateSmartMix() {
         if (mixArmed_) emit changed();
     }
     // Preload failures don't interrupt A. Normal end-of-track resolution retries B.
-    if (!player_.hasPrepared() && elapsed>8000) cancelSmartMix();
+    if (!player_.hasPrepared() && mixResolution_.isEmpty() && mixReadyUrl_.isEmpty() && elapsed>8000)
+        cancelSmartMix();
 }
 void PortableSession::commitSmartMix() {
     const int index=mixTargetIndex();
@@ -136,7 +160,8 @@ void PortableSession::commitSmartMix() {
     const bool mixed=mixArmed_;
     resetMixAnalysis();
     mixCooldown_=mixed ? (mixManual_ ? manualOverlap : naturalOverlap)+250 : 0;
-    mixTarget_.clear(); mixResolution_.clear(); mixManual_=false; mixArmed_=false;
+    mixTarget_.clear(); mixResolution_.clear(); mixReadyUrl_.clear(); mixReadyHeaders_.clear();
+    mixManual_=false; mixArmed_=false;
     mixAttempted_=false;
     ++generation_; ++seekRequest_;
     if (advance) navigation_.next(); else navigation_.setCurrent(index);

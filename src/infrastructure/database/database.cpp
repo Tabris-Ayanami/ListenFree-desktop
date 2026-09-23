@@ -20,6 +20,9 @@ namespace listenfree::infrastructure::database {
 
 namespace {
 
+constexpr qsizetype sparseCatalogChangeLimit = 256;
+constexpr qsizetype retainedCatalogChangeLimit = 4096;
+
 // Mirrors fooyin's per-connection pragma setup (src/utils/database/dbconnectionpool.cpp):
 // WAL keeps the GUI reader connection concurrent with the scan writer thread's
 // connection, and busy_timeout absorbs residual lock windows instead of failing
@@ -70,9 +73,15 @@ const std::array migrations{
               {QStringLiteral("CREATE TABLE IF NOT EXISTS library_folders (folder_id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE COLLATE NOCASE, added_ms INTEGER NOT NULL DEFAULT 0)")}},
     Migration{4, {QStringLiteral("CREATE TABLE IF NOT EXISTS duplicate_aliases (path TEXT PRIMARY KEY, keeper_id TEXT NOT NULL REFERENCES tracks(track_id) ON DELETE CASCADE, keeper_path TEXT NOT NULL, hash TEXT NOT NULL, size_bytes INTEGER NOT NULL, modified_ms INTEGER NOT NULL)")}},
     Migration{5, {QStringLiteral("CREATE TABLE IF NOT EXISTS library_exclusions (path TEXT PRIMARY KEY COLLATE NOCASE)")}},
+    Migration{6,
+              {QStringLiteral("CREATE TABLE IF NOT EXISTS catalog_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL CHECK(revision>=1), reset_revision INTEGER NOT NULL CHECK(reset_revision>=1 AND reset_revision<=revision))"),
+               QStringLiteral("INSERT OR IGNORE INTO catalog_state(singleton,revision,reset_revision) VALUES(1,1,1)"),
+               QStringLiteral("CREATE TABLE IF NOT EXISTS catalog_changes (track_id TEXT PRIMARY KEY, revision INTEGER NOT NULL)"),
+               QStringLiteral("CREATE INDEX IF NOT EXISTS idx_catalog_changes_revision ON catalog_changes(revision)"),
+               QStringLiteral("CREATE INDEX IF NOT EXISTS idx_track_artists_artist ON track_artists(artist_id)")}},
 };
 
-void rollback(QSqlDatabase& database) {
+void rollback(const QSqlDatabase& database) {
     QSqlQuery query(database);
     query.exec(QStringLiteral("ROLLBACK"));
 }
@@ -121,13 +130,195 @@ void hydrateRelations(const QSqlDatabase& database, domain::Track& track) {
     }
 }
 
+bool readCatalogState(const QSqlDatabase& database, CatalogSnapshotState& out) {
+    QSqlQuery query(database);
+    if (!query.exec(QStringLiteral(
+            "SELECT revision,reset_revision FROM catalog_state WHERE singleton=1")) ||
+        !query.next()) return false;
+    out.revision = query.value(0).toLongLong();
+    out.resetRevision = query.value(1).toLongLong();
+    return out.revision >= 1 && out.resetRevision >= 1 &&
+           out.resetRevision <= out.revision && !query.next() &&
+           !query.lastError().isValid();
+}
+
+bool loadCatalogTrack(const QSqlDatabase& database, const QString& id,
+                      std::optional<domain::Track>& out) {
+    QSqlQuery query(database);
+    query.setForwardOnly(true);
+    query.prepare(QStringLiteral(
+        "SELECT t.track_id,t.title,t.duration_ms,t.local_path,t.remote_url,"
+        "a.artist_id,a.name,al.album_id,al.title,al.artwork_url "
+        "FROM tracks t "
+        "LEFT JOIN track_artists ta ON ta.track_id=t.track_id "
+        "LEFT JOIN artists a ON a.artist_id=ta.artist_id "
+        "LEFT JOIN track_albums tal ON tal.track_id=t.track_id "
+        "LEFT JOIN albums al ON al.album_id=tal.album_id "
+        "WHERE t.track_id=? ORDER BY ta.ordinal"));
+    query.addBindValue(id);
+    if (!query.exec()) return false;
+    domain::Track track;
+    bool found = false;
+    while (query.next()) {
+        if (!found) {
+            found = true;
+            track.id = domain::TrackId(query.value(0).toString().toStdString());
+            track.title = query.value(1).toString().toStdString();
+            track.duration = std::chrono::milliseconds(query.value(2).toLongLong());
+            if (!query.value(3).isNull()) track.localPath = query.value(3).toString().toStdString();
+            if (!query.value(4).isNull()) track.remoteUrl = query.value(4).toString().toStdString();
+        }
+        if (!query.value(5).isNull()) {
+            track.artists.push_back({query.value(5).toString().toStdString(),
+                                     query.value(6).toString().toStdString()});
+        }
+        if (!track.album && !query.value(7).isNull()) {
+            domain::Album album;
+            album.id = query.value(7).toString().toStdString();
+            album.title = query.value(8).toString().toStdString();
+            if (!query.value(9).isNull()) album.artworkUrl = query.value(9).toString().toStdString();
+            track.album = std::move(album);
+        }
+    }
+    if (query.lastError().isValid()) return false;
+    if (found) out = std::move(track);
+    else out.reset();
+    return true;
+}
+
 } // namespace
+
+struct CatalogJournal {
+    explicit CatalogJournal(QSqlDatabase& connection)
+        : database(connection), record(connection), artistPeers(connection), albumPeers(connection) {
+        prepared = record.prepare(QStringLiteral(
+            "INSERT INTO catalog_changes(track_id,revision) VALUES(?,?) "
+            "ON CONFLICT(track_id) DO UPDATE SET revision=excluded.revision")) &&
+            artistPeers.prepare(QStringLiteral(
+                "INSERT INTO catalog_changes(track_id,revision) "
+                "SELECT track_id,? FROM track_artists WHERE artist_id=? "
+                "ON CONFLICT(track_id) DO UPDATE SET revision=excluded.revision")) &&
+            albumPeers.prepare(QStringLiteral(
+                "INSERT INTO catalog_changes(track_id,revision) "
+                "SELECT track_id,? FROM track_albums WHERE album_id=? "
+                "ON CONFLICT(track_id) DO UPDATE SET revision=excluded.revision"));
+    }
+
+    bool ensureRevision() {
+        if (!prepared) return false;
+        if (revision != 0) return true;
+        QSqlQuery advance(database);
+        if (!advance.exec(QStringLiteral(
+                "UPDATE catalog_state SET revision=revision+1 "
+                "WHERE singleton=1 AND revision<9223372036854775807")) ||
+            advance.numRowsAffected() != 1) return false;
+        QSqlQuery current(database);
+        if (!current.exec(QStringLiteral(
+                "SELECT revision FROM catalog_state WHERE singleton=1")) ||
+            !current.next()) return false;
+        revision = current.value(0).toLongLong();
+        return revision > 1;
+    }
+
+    bool track(const QString& id) {
+        if (resetMode) return true;
+        if (id.isEmpty() || !ensureRevision()) return false;
+        record.bindValue(0, id);
+        record.bindValue(1, revision);
+        const bool ok = record.exec();
+        record.finish();
+        return ok;
+    }
+
+    bool peerFanoutExceedsLimit(const QString& id, bool artist, bool& exceeds) {
+        QSqlQuery count(database);
+        const QString sql = artist
+            ? QStringLiteral(
+                "SELECT COUNT(*) FROM ("
+                "SELECT track_id FROM catalog_changes WHERE revision=? "
+                "UNION SELECT track_id FROM track_artists WHERE artist_id=? LIMIT ?)")
+            : QStringLiteral(
+                "SELECT COUNT(*) FROM ("
+                "SELECT track_id FROM catalog_changes WHERE revision=? "
+                "UNION SELECT track_id FROM track_albums WHERE album_id=? LIMIT ?)");
+        if (!count.prepare(sql)) return false;
+        count.addBindValue(revision);
+        count.addBindValue(id);
+        count.addBindValue(static_cast<qlonglong>(sparseCatalogChangeLimit + 1));
+        if (!count.exec() || !count.next()) return false;
+        exceeds = count.value(0).toLongLong() > sparseCatalogChangeLimit;
+        return !count.next() && !count.lastError().isValid();
+    }
+
+    bool sharedArtist(const QString& id) {
+        if (resetMode) return true;
+        if (!ensureRevision()) return false;
+        bool exceeds = false;
+        if (!peerFanoutExceedsLimit(id, true, exceeds)) return false;
+        if (exceeds) return reset();
+        artistPeers.bindValue(0, revision);
+        artistPeers.bindValue(1, id);
+        const bool ok = artistPeers.exec();
+        artistPeers.finish();
+        return ok;
+    }
+
+    bool sharedAlbum(const QString& id) {
+        if (resetMode) return true;
+        if (!ensureRevision()) return false;
+        bool exceeds = false;
+        if (!peerFanoutExceedsLimit(id, false, exceeds)) return false;
+        if (exceeds) return reset();
+        albumPeers.bindValue(0, revision);
+        albumPeers.bindValue(1, id);
+        const bool ok = albumPeers.exec();
+        albumPeers.finish();
+        return ok;
+    }
+
+    bool reset() {
+        if (resetMode) return true;
+        if (!ensureRevision()) return false;
+        QSqlQuery state(database);
+        if (!state.exec(QStringLiteral(
+                "UPDATE catalog_state SET reset_revision=revision WHERE singleton=1"))) return false;
+        QSqlQuery changes(database);
+        if (!changes.exec(QStringLiteral("DELETE FROM catalog_changes"))) return false;
+        resetMode = true;
+        return true;
+    }
+
+    // Readers older than a reset revision reload the complete projection.
+    // Keep a bounded number of distinct IDs even when a scan commits many
+    // small batches, without adding an O(unbounded journal size) count query.
+    bool enforceCumulativeLimit() {
+        if (revision == 0 || resetMode) return true;
+        QSqlQuery overflow(database);
+        if (!overflow.prepare(QStringLiteral(
+                "SELECT 1 FROM catalog_changes LIMIT 1 OFFSET ?"))) return false;
+        overflow.addBindValue(retainedCatalogChangeLimit);
+        if (!overflow.exec()) return false;
+        const bool exceeds = overflow.next();
+        if (overflow.lastError().isValid()) return false;
+        overflow.finish();
+        return !exceeds || reset();
+    }
+
+    QSqlDatabase& database;
+    QSqlQuery record;
+    QSqlQuery artistPeers;
+    QSqlQuery albumPeers;
+    std::int64_t revision = 0;
+    bool prepared = false;
+    bool resetMode = false;
+};
 
 Database::~Database() { close(); }
 bool Database::clearScrollPositions() {QSqlQuery query(db_);return query.exec("DELETE FROM settings WHERE key LIKE 'scroll.%'");}
 
 bool Database::mergeDuplicate(const QVariantMap& duplicate,const QVariantMap& keeper,const QString& hash,bool alias) {
     if (!db_.transaction()) return false;
+    CatalogJournal journal(db_);
     const auto oldId=duplicate.value("id").toString(), newId=keeper.value("id").toString();
     const auto oldPath=duplicate.value("path").toString(), newPath=keeper.value("path").toString();
     auto execute=[&](const QString& sql,const QVariantList& args) {
@@ -160,7 +351,8 @@ bool Database::mergeDuplicate(const QVariantMap& duplicate,const QVariantMap& ke
         {oldPath,newId,newPath,hash,duplicate.value("size"),duplicate.value("modified")});
     ok=ok && execute("UPDATE duplicate_aliases SET keeper_id=?,keeper_path=? WHERE keeper_id=?",{newId,newPath,oldId});
     ok=ok && execute("DELETE FROM tracks WHERE track_id=?",{oldId});
-    if(ok && db_.commit())return true;
+    ok=ok && journal.track(oldId) && journal.track(newId);
+    if(ok && journal.enforceCumulativeLimit() && db_.commit())return true;
     db_.rollback();return false;
 }
 
@@ -315,11 +507,13 @@ UpsertStatements::UpsertStatements(QSqlDatabase& database)
     clearFiles.prepare(QStringLiteral("DELETE FROM local_files WHERE track_id = ?"));
     artist.prepare(QStringLiteral(
         "INSERT INTO artists(artist_id,name) VALUES(?,?) "
-        "ON CONFLICT(artist_id) DO UPDATE SET name=excluded.name"));
+        "ON CONFLICT(artist_id) DO UPDATE SET name=excluded.name "
+        "WHERE artists.name IS NOT excluded.name"));
     linkArtist.prepare(QStringLiteral("INSERT INTO track_artists(track_id,artist_id,ordinal) VALUES(?,?,?)"));
     album.prepare(QStringLiteral(
         "INSERT INTO albums(album_id,title,artwork_url) VALUES(?,?,?) "
-        "ON CONFLICT(album_id) DO UPDATE SET title=excluded.title,artwork_url=excluded.artwork_url"));
+        "ON CONFLICT(album_id) DO UPDATE SET title=excluded.title,artwork_url=excluded.artwork_url "
+        "WHERE albums.title IS NOT excluded.title OR albums.artwork_url IS NOT excluded.artwork_url"));
     linkAlbum.prepare(QStringLiteral("INSERT INTO track_albums(track_id,album_id) VALUES(?,?)"));
     localFile.prepare(QStringLiteral(
             "INSERT INTO local_files(canonical_path,track_id,size_bytes,modified_ms) "
@@ -332,6 +526,8 @@ bool Database::upsertTracks(std::span<const domain::Track> tracks, bool fromScan
     QSqlQuery begin(db_);
     if (!begin.exec(QStringLiteral("BEGIN IMMEDIATE"))) return false;
     UpsertStatements statements(db_);
+    CatalogJournal journal(db_);
+    QSet<QString> acceptedIds;
     QSqlQuery excluded(db_);
     if(fromScan && !excluded.prepare("SELECT 1 FROM library_exclusions WHERE path=?")) { rollback(db_); return false; }
     for (const auto& track : tracks) {
@@ -347,10 +543,21 @@ bool Database::upsertTracks(std::span<const domain::Track> tracks, bool fromScan
             // were read before the user removed this file from the library.
             if(skip)continue;
         }
-        if (!upsertTrackRows(track, statements)) {
+        if (!journal.resetMode) {
+            acceptedIds.insert(QString::fromStdString(track.id.value()));
+            if (acceptedIds.size() > sparseCatalogChangeLimit) {
+                if (!journal.reset()) { rollback(db_); return false; }
+                acceptedIds.clear();
+            }
+        }
+        if (!upsertTrackRows(track, statements, journal)) {
             rollback(db_);
             return false;
         }
+    }
+    if (!journal.enforceCumulativeLimit()) {
+        rollback(db_);
+        return false;
     }
     QSqlQuery commit(db_);
     if (!commit.exec(QStringLiteral("COMMIT"))) {
@@ -360,14 +567,11 @@ bool Database::upsertTracks(std::span<const domain::Track> tracks, bool fromScan
     return true;
 }
 
-bool Database::upsertTrackRows(const domain::Track& track) {
-    UpsertStatements statements(db_);
-    return upsertTrackRows(track, statements);
-}
-
-bool Database::upsertTrackRows(const domain::Track& track, UpsertStatements& statements) {
+bool Database::upsertTrackRows(const domain::Track& track, UpsertStatements& statements,
+                               CatalogJournal& journal) {
     if (track.id.empty()) return false;
     const QString trackId = QString::fromStdString(track.id.value());
+    if (!journal.track(trackId)) return false;
     if(track.localPath) {
         QSqlQuery clearAlias(db_); clearAlias.prepare("DELETE FROM duplicate_aliases WHERE path=?");
         clearAlias.addBindValue(QDir::fromNativeSeparators(QString::fromStdString(*track.localPath)));
@@ -402,7 +606,9 @@ bool Database::upsertTrackRows(const domain::Track& track, UpsertStatements& sta
             rollback(db_);
             return false;
         }
+        const bool changed = upsertArtist.numRowsAffected() > 0;
         upsertArtist.finish();
+        if (changed && !journal.sharedArtist(QString::fromStdString(artist.id))) return false;
         QSqlQuery& link = statements.linkArtist;
         link.addBindValue(trackId);
         link.addBindValue(QString::fromStdString(artist.id));
@@ -424,7 +630,9 @@ bool Database::upsertTrackRows(const domain::Track& track, UpsertStatements& sta
             rollback(db_);
             return false;
         }
+        const bool changed = upsertAlbum.numRowsAffected() > 0;
         upsertAlbum.finish();
+        if (changed && !journal.sharedAlbum(QString::fromStdString(track.album->id))) return false;
         QSqlQuery& link = statements.linkAlbum;
         link.addBindValue(trackId);
         link.addBindValue(QString::fromStdString(track.album->id));
@@ -507,6 +715,135 @@ std::vector<domain::Track> Database::loadTracks() const {
     return result;
 }
 
+bool Database::forEachTrack(const std::function<void(domain::Track&&)>& callback) const {
+    if (!isOpen()) return false;
+
+    QSqlQuery query(db_);
+    query.setForwardOnly(true);
+    // The title index used by loadTracks() returns equal titles in rowid
+    // order. State that tie order explicitly so joins cannot reorder tracks.
+    // track_albums has one row per track, so artist rows are not multiplied.
+    if (!query.exec(QStringLiteral(
+            "SELECT t.track_id,t.title,t.duration_ms,t.local_path,t.remote_url,"
+            "a.artist_id,a.name,al.album_id,al.title,al.artwork_url "
+            "FROM tracks t "
+            "LEFT JOIN track_artists ta ON ta.track_id=t.track_id "
+            "LEFT JOIN artists a ON a.artist_id=ta.artist_id "
+            "LEFT JOIN track_albums tal ON tal.track_id=t.track_id "
+            "LEFT JOIN albums al ON al.album_id=tal.album_id "
+            "ORDER BY t.title,t.rowid,ta.ordinal"))) return false;
+
+    domain::Track track;
+    QString trackId;
+    bool hasTrack = false;
+    while (query.next()) {
+        const QString rowId = query.value(0).toString();
+        if (!hasTrack || rowId != trackId) {
+            if (hasTrack) callback(std::move(track));
+            track = {};
+            trackId = rowId;
+            hasTrack = true;
+            track.id = domain::TrackId(rowId.toStdString());
+            track.title = query.value(1).toString().toStdString();
+            track.duration = std::chrono::milliseconds(query.value(2).toLongLong());
+            if (!query.value(3).isNull()) track.localPath = query.value(3).toString().toStdString();
+            if (!query.value(4).isNull()) track.remoteUrl = query.value(4).toString().toStdString();
+        }
+        // Match hydrateRelations' inner joins: a dangling relation with no
+        // artist or album record contributes nothing to the domain track.
+        if (!query.value(5).isNull()) {
+            track.artists.push_back({query.value(5).toString().toStdString(),
+                                     query.value(6).toString().toStdString()});
+        }
+        if (!track.album && !query.value(7).isNull()) {
+            domain::Album album;
+            album.id = query.value(7).toString().toStdString();
+            album.title = query.value(8).toString().toStdString();
+            if (!query.value(9).isNull()) album.artworkUrl = query.value(9).toString().toStdString();
+            track.album = std::move(album);
+        }
+    }
+    if (query.lastError().isValid()) return false;
+    if (hasTrack) callback(std::move(track));
+    return true;
+}
+
+bool Database::forEachTrackWithRevision(
+    const std::function<void(domain::Track&&)>& callback, CatalogSnapshotState& out) const {
+    if (!isOpen()) return false;
+    QSqlQuery transaction(db_);
+    if (!transaction.exec(QStringLiteral("BEGIN"))) return false;
+    CatalogSnapshotState state;
+    if (!readCatalogState(db_, state) || !forEachTrack(callback)) {
+        rollback(db_);
+        return false;
+    }
+    if (!transaction.exec(QStringLiteral("COMMIT"))) {
+        rollback(db_);
+        return false;
+    }
+    out = state;
+    return true;
+}
+
+bool Database::readCatalogDelta(std::int64_t afterRevision, std::size_t maxChanges,
+                                CatalogDelta& out) const {
+    if (!isOpen()) return false;
+    QSqlQuery transaction(db_);
+    if (!transaction.exec(QStringLiteral("BEGIN"))) return false;
+
+    CatalogDelta result;
+    if (!readCatalogState(db_, result.state)) {
+        rollback(db_);
+        return false;
+    }
+    if (afterRevision < result.state.resetRevision ||
+        afterRevision > result.state.revision || afterRevision < 0) {
+        result.requiresFullReload = true;
+    } else if (afterRevision < result.state.revision) {
+        // The initial sparse path only needs a few hundred IDs. A hard ceiling
+        // prevents accidental unbounded hydration by another caller.
+        const std::size_t boundedMax = std::min(maxChanges, std::size_t{4096});
+        QSqlQuery changes(db_);
+        changes.prepare(QStringLiteral(
+            "SELECT track_id FROM catalog_changes WHERE revision>? "
+            "ORDER BY revision,track_id LIMIT ?"));
+        changes.addBindValue(afterRevision);
+        changes.addBindValue(static_cast<qlonglong>(boundedMax + 1));
+        if (!changes.exec()) {
+            rollback(db_);
+            return false;
+        }
+        QStringList ids;
+        while (changes.next()) ids.push_back(changes.value(0).toString());
+        if (changes.lastError().isValid()) {
+            rollback(db_);
+            return false;
+        }
+        changes.finish();
+        if (ids.isEmpty() || static_cast<std::size_t>(ids.size()) > boundedMax) {
+            result.requiresFullReload = true;
+        } else {
+            result.changes.reserve(static_cast<std::size_t>(ids.size()));
+            for (const auto& id : ids) {
+                CatalogTrackChange changed;
+                changed.trackId = id.toStdString();
+                if (!loadCatalogTrack(db_, id, changed.track)) {
+                    rollback(db_);
+                    return false;
+                }
+                result.changes.push_back(std::move(changed));
+            }
+        }
+    }
+    if (!transaction.exec(QStringLiteral("COMMIT"))) {
+        rollback(db_);
+        return false;
+    }
+    out = std::move(result);
+    return true;
+}
+
 std::vector<application::LocalFileFingerprint> Database::loadLocalFiles() const {
     std::vector<application::LocalFileFingerprint> result;
     if (!isOpen()) return result;
@@ -585,6 +922,16 @@ bool Database::removeLibraryFolder(std::int64_t id, const QString& path) {
         return false;
     }
 
+    QSqlQuery affected(db_);
+    affected.prepare(QStringLiteral(
+        "SELECT DISTINCT track_id FROM local_files WHERE canonical_path LIKE ? ESCAPE '\\'"));
+    affected.addBindValue(libraryPrefixPattern(storedPath));
+    if (!affected.exec()) { rollback(db_); return false; }
+    QStringList affectedIds;
+    while (affected.next()) affectedIds.push_back(affected.value(0).toString());
+    if (affected.lastError().isValid()) { rollback(db_); return false; }
+    affected.finish();
+
     QSqlQuery tracks(db_);
     tracks.prepare(QStringLiteral(
         "DELETE FROM tracks WHERE track_id IN ("
@@ -602,10 +949,21 @@ bool Database::removeLibraryFolder(std::int64_t id, const QString& path) {
         rollback(db_);
         return false;
     }
+    const bool removedFolder = remove.numRowsAffected() > 0;
 
+    CatalogJournal journal(db_);
+    if (affectedIds.size() > sparseCatalogChangeLimit) {
+        if (!journal.reset()) { rollback(db_); return false; }
+    } else {
+        for (const auto& trackId : affectedIds) {
+            if (!journal.track(trackId)) { rollback(db_); return false; }
+        }
+    }
+
+    if (!journal.enforceCumulativeLimit()) { rollback(db_); return false; }
     QSqlQuery commit(db_);
-    if (!commit.exec(QStringLiteral("COMMIT"))) return false;
-    return remove.numRowsAffected() > 0;
+    if (!commit.exec(QStringLiteral("COMMIT"))) { rollback(db_); return false; }
+    return removedFolder;
 }
 
 std::vector<domain::Playlist> Database::loadPlaylists() const {
@@ -731,6 +1089,13 @@ std::vector<domain::Track> Database::searchTracks(const QString& queryText) cons
     return result;
 }
 
+std::uint64_t Database::trackCount() const {
+    if (!isOpen()) return 0;
+    QSqlQuery query(db_);
+    if (!query.exec(QStringLiteral("SELECT COUNT(*) FROM tracks")) || !query.next()) return 0;
+    return query.value(0).toULongLong();
+}
+
 std::optional<std::string> Database::getSetting(const QString& key) const {
     if (!isOpen() || key.isEmpty()) return std::nullopt;
     QSqlQuery query(db_);
@@ -757,13 +1122,19 @@ bool Database::clearLibraryIndex() {
     if (!db_.transaction()) return false;
     QSqlQuery query(db_);
     if (!query.exec("DELETE FROM tracks") || !query.exec("DELETE FROM albums") || !query.exec("DELETE FROM artists")) { db_.rollback(); return false; }
-    return db_.commit();
+    CatalogJournal journal(db_);
+    if (!journal.reset() || !journal.enforceCumulativeLimit() || !db_.commit()) {
+        db_.rollback();
+        return false;
+    }
+    return true;
 }
 
 bool Database::restoreMissingRelations(std::span<const domain::Track> tracks) {
     if (!isOpen()) return false;
     QSqlQuery transaction(db_);
     if (!transaction.exec(QStringLiteral("BEGIN IMMEDIATE"))) return false;
+    CatalogJournal journal(db_);
     UpsertStatements statements(db_);
     statements.artist.prepare(QStringLiteral("INSERT OR IGNORE INTO artists(artist_id,name) VALUES(?,?)"));
     statements.album.prepare(QStringLiteral("INSERT OR IGNORE INTO albums(album_id,title,artwork_url) VALUES(?,?,?)"));
@@ -771,10 +1142,12 @@ bool Database::restoreMissingRelations(std::span<const domain::Track> tracks) {
         for (const auto& value : values) query.addBindValue(value);
         const bool ok = query.exec(); query.finish(); return ok;
     };
+    QSet<QString> repairedIds;
     for (const auto& track : tracks) {
         const auto current = findTrack(track.id);
         if (!current) continue;
         const auto id = QString::fromStdString(track.id.value());
+        bool touched = false;
         if (current->artists.empty()) {
             int ordinal = 0;
             for (const auto& artist : track.artists) {
@@ -782,6 +1155,7 @@ bool Database::restoreMissingRelations(std::span<const domain::Track> tracks) {
                 const auto artistId = QString::fromStdString(artist.id);
                 if (!execute(statements.artist, {artistId, QString::fromStdString(artist.name)}) ||
                     !execute(statements.linkArtist, {id, artistId, ordinal++})) { rollback(db_); return false; }
+                touched = true;
             }
         }
         if (!current->album && track.album && !track.album->id.empty()) {
@@ -789,16 +1163,32 @@ bool Database::restoreMissingRelations(std::span<const domain::Track> tracks) {
             if (!execute(statements.album, {albumId, QString::fromStdString(track.album->title),
                     track.album->artworkUrl ? QVariant(QString::fromStdString(*track.album->artworkUrl)) : QVariant{}}) ||
                 !execute(statements.linkAlbum, {id, albumId})) { rollback(db_); return false; }
+            touched = true;
+        }
+        if (touched && !journal.resetMode) {
+            repairedIds.insert(id);
+            if (repairedIds.size() > sparseCatalogChangeLimit) {
+                if (!journal.reset()) { rollback(db_); return false; }
+            } else if (!journal.track(id)) { rollback(db_); return false; }
         }
     }
+    if (!journal.enforceCumulativeLimit()) { rollback(db_); return false; }
     if (!transaction.exec(QStringLiteral("COMMIT"))) { rollback(db_); return false; }
     return true;
 }
 bool Database::removeTrack(const QString& id) {
+    if (!isOpen() || id.isEmpty() || !db_.transaction()) return false;
     QSqlQuery query(db_);
     query.prepare("DELETE FROM tracks WHERE track_id = ?");
     query.addBindValue(id);
-    return query.exec();
+    if (!query.exec()) { db_.rollback(); return false; }
+    CatalogJournal journal(db_);
+    if ((query.numRowsAffected() > 0 && !journal.track(id)) ||
+        !journal.enforceCumulativeLimit() || !db_.commit()) {
+        db_.rollback();
+        return false;
+    }
+    return true;
 }
 bool Database::removeLocalTrack(const QString& path, bool excludeFromScan) {
     if(path.isEmpty() || !db_.transaction())return false;
@@ -810,9 +1200,26 @@ bool Database::removeLocalTrack(const QString& path, bool excludeFromScan) {
         query.prepare("INSERT OR IGNORE INTO library_exclusions(path) VALUES(?)");query.addBindValue(normalized);
         if(!query.exec()) { db_.rollback(); return false; }
     }
+    QSqlQuery affected(db_);
+    affected.prepare("SELECT track_id FROM tracks WHERE replace(local_path,'\\','/')=? COLLATE NOCASE");
+    affected.addBindValue(normalized);
+    if (!affected.exec()) { db_.rollback(); return false; }
+    QStringList affectedIds;
+    while (affected.next()) affectedIds.push_back(affected.value(0).toString());
+    if (affected.lastError().isValid()) { db_.rollback(); return false; }
+    affected.finish();
     query.prepare("DELETE FROM tracks WHERE replace(local_path,'\\','/')=? COLLATE NOCASE");
     query.addBindValue(normalized);
-    if(!query.exec() || !db_.commit()) { db_.rollback(); return false; }
+    if(!query.exec()) { db_.rollback(); return false; }
+    CatalogJournal journal(db_);
+    if (affectedIds.size() > sparseCatalogChangeLimit) {
+        if (!journal.reset()) { db_.rollback(); return false; }
+    } else {
+        for (const auto& trackId : affectedIds) {
+            if (!journal.track(trackId)) { db_.rollback(); return false; }
+        }
+    }
+    if (!journal.enforceCumulativeLimit() || !db_.commit()) { db_.rollback(); return false; }
     return true;
 }
 bool Database::restoreExcludedFiles(const QStringList& roots) {
@@ -886,13 +1293,25 @@ bool Database::pruneMissingLocalFiles(const QStringList& roots, bool recursive) 
     files.finish();
     if(missing.isEmpty())return true;
     if(!db_.transaction())return false;
+    CatalogJournal journal(db_);
+    QSet<QString> removedIds;
     QSqlQuery remove(db_);remove.prepare("DELETE FROM tracks WHERE track_id=? AND replace(local_path,'\\','/')=? COLLATE NOCASE");
     for(const auto& [id,path]:missing) {
         if(!absent(path))continue;
         remove.bindValue(0,id);remove.bindValue(1,path);
         if(!remove.exec()) { db_.rollback(); return false; }
+        if(remove.numRowsAffected()>0) {
+            if (!journal.resetMode) {
+                removedIds.insert(id);
+                if (removedIds.size() > sparseCatalogChangeLimit && !journal.reset()) {
+                    db_.rollback();
+                    return false;
+                }
+            }
+            if (!journal.track(id)) { db_.rollback(); return false; }
+        }
     }
-    if(!db_.commit()) { db_.rollback(); return false; }
+    if(!journal.enforceCumulativeLimit() || !db_.commit()) { db_.rollback(); return false; }
     return true;
 }
 }

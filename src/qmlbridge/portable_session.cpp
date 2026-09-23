@@ -1,4 +1,5 @@
 #include "qmlbridge/portable_session.h"
+#include "qmlbridge/cover_image_provider.h"
 #include "infrastructure/library/library_scanner.h"
 #include "online/kuwo_lyrics.h"
 #include "online/platform_catalog.h"
@@ -11,6 +12,7 @@
 #include <QSaveFile>
 #include <cmath>
 #include <QDateTime>
+#include <QCryptographicHash>
 #include <QSettings>
 #include <QtConcurrentRun>
 #include <QFileDialog>
@@ -23,6 +25,7 @@
 #include <QRegularExpression>
 #include <QTextDocumentFragment>
 #include <QTimer>
+#include <QThreadPool>
 #include <QUuid>
 #include <QUrlQuery>
 #include <algorithm>
@@ -37,18 +40,94 @@ QString localArtworkUrl(const QString& path) {
     return "image://covers/" + QString::fromLatin1(QUrl::toPercentEncoding(path)) + "?v="
         + QString::number(info.lastModified().toMSecsSinceEpoch()) + "-" + QString::number(info.size());
 }
-QString collectionArtworkUrl(const QStringList& candidates) {
+QString collectionArtworkUrl(QStringList&& candidates, const QString& identity,
+                             const QSet<QString>& retainedIdentities,
+                             CollectionCoverIndex::Candidates& index,
+                             QSet<QString>& indexedIdentities) {
     if (candidates.isEmpty()) return {};
-    if (candidates.size() == 1) return candidates.front();
-    QJsonArray localIds;
+    if (candidates.size() == 1) {
+        const auto direct = candidates.front();
+        // Keep the identity alive for a stale multi-candidate request even
+        // when this group now has only one track. New singleton groups need no
+        // index entry, even in a library with many unique albums.
+        if (direct.startsWith("image://covers/") && retainedIdentities.contains(identity)) {
+            const auto group = QCryptographicHash::hash(identity.toUtf8(), QCryptographicHash::Sha256).toHex().left(24);
+            index.insert(QStringLiteral("collection-index/") + QString::fromLatin1(group), std::move(candidates));
+            indexedIdentities.insert(identity);
+        }
+        return direct;
+    }
     for (const auto& url : candidates) {
         if (!url.startsWith("image://covers/")) return url;
-        localIds.append(url.mid(15));
     }
-    // Resolve on the existing provider thread; file versions invalidate Qt's cache.
-    return "image://covers/collection/" + QString::fromLatin1(
-        QJsonDocument(localIds).toJson(QJsonDocument::Compact).toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals));
+    // The identity is stable across reloads; the content hash changes with
+    // order, membership and each local file's mtime/size cache token.
+    QCryptographicHash content(QCryptographicHash::Sha256);
+    for (const auto& candidate : candidates) {
+        const auto bytes = candidate.toUtf8();
+        content.addData(QByteArray::number(bytes.size()));
+        content.addData(QByteArrayView(":"));
+        content.addData(bytes);
+    }
+    const auto version = content.result().toHex().left(24);
+    const auto group = QCryptographicHash::hash(identity.toUtf8(), QCryptographicHash::Sha256).toHex().left(24);
+    const auto groupId = QStringLiteral("collection-index/") + QString::fromLatin1(group);
+    index.insert(groupId, std::move(candidates));
+    indexedIdentities.insert(identity);
+    return QStringLiteral("image://covers/") + groupId + QLatin1Char('/')
+        + QString::fromLatin1(version);
 }
+struct CatalogAggregates {
+    QMap<QString, QVariantMap> albums;
+    QMap<QString, QVariantMap> artists;
+    QMap<QString, QStringList> albumCovers;
+    QMap<QString, QStringList> artistCovers;
+
+    void add(const QVariantMap& row) {
+        const auto artist = row.value("artist").toString();
+        const auto title = row.value("album").toString();
+        const auto albumKey = artist + QChar(0x1f) + title;
+        auto& album = albums[albumKey];
+        album["title"] = title.isEmpty() ? QStringLiteral("未知专辑") : title;
+        album["artist"] = artist;
+        album["subtitle"] = artist;
+        const auto artwork = row.value("artwork").toString();
+        if (!artwork.isEmpty()) {
+            albumCovers[albumKey].prepend(artwork);
+            artistCovers[artist].prepend(artwork);
+        }
+        album["cover"] = 0;
+        album["count"] = album.value("count").toInt() + 1;
+        auto& person = artists[artist];
+        person["name"] = artist.isEmpty() ? QStringLiteral("未知艺术家") : artist;
+        person["title"] = person["name"];
+        person["count"] = person.value("count").toInt() + 1;
+        person["cover"] = 0;
+    }
+
+    void finish(QVariantList& albumRows, QVariantList& artistRows,
+                const QSet<QString>& retainedIdentities,
+                CollectionCoverIndex::Candidates& coverIndex,
+                QSet<QString>& indexedIdentities) {
+        for (auto it = albums.begin(); it != albums.end(); ++it)
+            it.value()["artwork"] = collectionArtworkUrl(albumCovers.take(it.key()),
+                QStringLiteral("album:") + it.key(), retainedIdentities, coverIndex, indexedIdentities);
+        for (auto it = artists.begin(); it != artists.end(); ++it)
+            it.value()["artwork"] = collectionArtworkUrl(artistCovers.take(it.key()),
+                QStringLiteral("artist:") + it.key(), retainedIdentities, coverIndex, indexedIdentities);
+        albumRows.reserve(albums.size());
+        for (const auto& album : albums) {
+            albumRows.append(album);
+            auto& artist = artists[album.value("artist").toString()];
+            artist["albumCount"] = artist.value("albumCount").toInt() + 1;
+        }
+        for (auto it = artists.begin(); it != artists.end(); ++it)
+            it.value()["subtitle"] = QStringLiteral("%1 首 · %2 张专辑")
+                .arg(it.value().value("count").toInt()).arg(it.value().value("albumCount").toInt());
+        artistRows.reserve(artists.size());
+        for (const auto& artist : artists) artistRows.append(artist);
+    }
+};
 QString songKey(const QVariantMap& track) {
     if(!track.value("radioId").toString().isEmpty())return "radio:"+track.value("radioProvider").toString()+":"+track.value("radioId").toString();
     const auto path=track.value("localPath").toString();
@@ -109,7 +188,14 @@ domain::Track PortableSession::toTrack(const QVariantMap& map) {
 }
 PortableSession::PortableSession(infrastructure::database::Database& database, const QString& path,
                                  SourceController& sources, QObject* parent)
-    : QObject(parent), database_(database), databasePath_(path), sources_(sources) {
+    : QObject(parent), database_(database), databasePath_(path), sources_(sources),
+      collectionCoverIndex_(std::make_shared<CollectionCoverIndex>()) {
+    // Position ticks are frequent. Keep QML's state, volume, format and error
+    // bindings out of that hot path while still refreshing progress whenever a
+    // broader playback, track or lyric change affects its derived values.
+    connect(this, &PortableSession::changed, this, &PortableSession::progressChanged);
+    connect(this, &PortableSession::currentTrackChanged, this, &PortableSession::progressChanged);
+    connect(this, &PortableSession::lyricsChanged, this, &PortableSession::progressChanged);
     connect(&lyricSearch_, &online::LyricSearch::changed, this, &PortableSession::lyricMatchChanged);
     uiSettings_.setGroupsEnabled(false);
     QSettings().setValue("ListenFree/clearShuffleHistory",QString::fromStdString(database_.getSetting("playback.clearShuffleHistory").value_or("true"))=="true");
@@ -138,7 +224,7 @@ PortableSession::PortableSession(infrastructure::database::Database& database, c
         }
         if(position.count()>5000)consecutiveErrors_=0;
         if(position.count()>30000)radioRetries_=0;
-        emit changed();
+        emit progressChanged();
     };
     events.onDurationChanged = [this](auto) { emit changed(); };
     events.onSeekableChanged = [this](bool) { emit changed(); };
@@ -200,8 +286,21 @@ PortableSession::PortableSession(infrastructure::database::Database& database, c
             [this](const QString& id, const QString&, const QString&, const QVariantMap& data, const QString& error) {
         if (id == mixResolution_ && !id.isEmpty()) {
             mixResolution_.clear();
-            if (!error.isEmpty()) { cancelSmartMix(); return; }
-            queueSmartMix(data.value("url").toString(), data.value("headers").toMap());
+            const int manualTarget=mixManual_ ? mixTargetIndex() : -1;
+            if (!error.isEmpty()) {
+                cancelSmartMix();
+                if (manualTarget>=0) { navigation_.setCurrent(manualTarget); beginCurrent(); }
+                return;
+            }
+            const auto url=data.value("url").toString();
+            const auto headers=data.value("headers").toMap();
+            const auto mixEnd=effectiveMixEnd_>0?effectiveMixEnd_:duration();
+            if (!mixManual_ && mixEnd-position()>10000) {
+                mixReadyUrl_=url; mixReadyHeaders_=headers;
+            } else queueSmartMix(url, headers);
+            if (manualTarget>=0 && mixTarget_.isEmpty()) {
+                navigation_.setCurrent(manualTarget); beginCurrent();
+            }
             return;
         }
         if (id != pending_ || currentTrack().value("entryId").toString() != pendingEntry_) return;
@@ -214,57 +313,79 @@ PortableSession::PortableSession(infrastructure::database::Database& database, c
     });
     connect(&sources_, &SourceController::activeChanged, this, [this] { if (loading_) stop(); });
     connect(&libraryLoad_, &QFutureWatcher<LibraryLoadResult>::finished, this, [this] {
-        libraryReloadActive_=false;
-        if(reloadAgain_) { reloadAgain_=false;reload();return; }
-        // result() copies the vector and leaves another complete catalog in
-        // the watcher's future until the next scan. Consume the finished value.
+        // Consume the completed snapshot: result() would retain a full prior
+        // generation in the watcher until the next scan.
         auto future = libraryLoad_.future();
         auto result = future.takeResult();
-        auto values = std::move(result.tracks);
-        for (const auto& repaired : result.repaired) {
-            const auto row = toMap(repaired);
-            for (auto& entry : entries_) if (songKey(entry) == songKey(row)) {
-                for (const auto& key : {"title", "artist", "album"}) entry[key] = row.value(key);
+        for (const auto& repaired : result.repaired)
+            pendingRepairedTrackIds_.insert(s(repaired.id.value()));
+        if (reloadAgain_) {
+            const bool allowDelta = !reloadAgainForceFull_;
+            reloadAgain_ = false;
+            reloadAgainForceFull_ = false;
+            libraryReloadActive_ = false;
+            scheduleReload(allowDelta);
+            return;
+        }
+        if (!result.valid || (result.usedDelta && result.baseCatalogRevision != catalogRevision_)) {
+            libraryReloadActive_ = false;
+            if (result.usedDelta) scheduleReload(false);
+            return;
+        }
+        if (!pendingRepairedTrackIds_.isEmpty()) {
+            int repairedCount = 0;
+            for (const auto& id : std::as_const(pendingRepairedTrackIds_)) {
+                const auto current = database_.findTrack(domain::TrackId(id.toStdString()));
+                if (!current) continue;
+                const auto row = toMap(*current);
+                for (auto& entry : entries_) if (songKey(entry) == songKey(row)) {
+                    for (const auto& key : {"title", "artist", "album"}) entry[key] = row.value(key);
+                }
+                emit trackMetadataChanged(row);
+                ++repairedCount;
             }
-            emit trackMetadataChanged(row);
+            pendingRepairedTrackIds_.clear();
+            if (repairedCount) { syncQueue(); emit currentTrackChanged(); }
         }
-        if (!result.repaired.empty()) { syncQueue(); emit currentTrackChanged(); }
-        songs_.clear(); albums_.clear(); artists_.clear();
-        QMap<QString, QVariantMap> albums, artists;
-        QMap<QString, QStringList> albumCovers, artistCovers;
-        for (const auto& track : values) {
-            const auto row = toMap(track);
-            songs_.append(row);
-            const auto artist = row.value("artist").toString();
-            const auto title = row.value("album").toString();
-            const auto albumKey = artist + QChar(0x1f) + title;
-            auto& album = albums[albumKey];
-            album["title"] = title.isEmpty() ? QStringLiteral("未知专辑") : title;
-            album["artist"] = artist; album["subtitle"] = artist;
-            const auto artwork = row.value("artwork").toString();
-            if (!artwork.isEmpty()) {
-                albumCovers[albumKey].prepend(artwork);
-                artistCovers[artist].prepend(artwork);
-            }
-            album["cover"] = 0;
-            album["count"] = album.value("count").toInt() + 1;
-            auto& person = artists[artist];
-            person["name"] = artist.isEmpty() ? QStringLiteral("未知艺术家") : artist;
-            person["title"] = person["name"]; person["count"] = person.value("count").toInt() + 1;
-            person["cover"] = 0;
+        if (result.noChanges) {
+            libraryReloadActive_ = false;
+            return;
         }
-        for (auto it = albums.begin(); it != albums.end(); ++it) it.value()["artwork"] = collectionArtworkUrl(albumCovers.value(it.key()));
-        for (auto it = artists.begin(); it != artists.end(); ++it) it.value()["artwork"] = collectionArtworkUrl(artistCovers.value(it.key()));
-        for (const auto& album : albums) {
-            albums_.append(album);
-            auto& artist=artists[album.value("artist").toString()];
-            artist["albumCount"]=artist.value("albumCount").toInt()+1;
-        }
-        for(auto it=artists.begin();it!=artists.end();++it) it.value()["subtitle"]=QStringLiteral("%1 首 · %2 张专辑").arg(it.value().value("count").toInt()).arg(it.value().value("albumCount").toInt());
-        for (const auto& artist : artists) artists_.append(artist);
-        tracks_.setRows(songs_); ready_ = true;
+        // Keep the previous shared row storage alive across the model swap.
+        // Releasing its final 100k-map reference on the GUI thread otherwise
+        // stalls the event loop even when no view is reset.
+        auto retiredSongs = std::move(songs_);
+        const bool preserveIndexes = ready_ && result.baseCatalogRevision == catalogRevision_ && result.sameTrackOrder;
+        songs_ = std::move(result.songs);
+        albums_ = std::move(result.albums);
+        artists_ = std::move(result.artists);
+        auto retiredCoverIdentities = std::move(indexedCoverIdentities_);
+        indexedCoverIdentities_ = std::move(result.coverIdentities);
+        // Image requests may race this swap. Each request takes an implicitly
+        // shared candidate list before leaving the index read lock.
+        auto retiredCovers = collectionCoverIndex_->replace(std::move(result.coverCandidates));
+        if (!preserveIndexes || !tracks_.replaceRowsSameOrder(songs_, result.changedTrackRows))
+            tracks_.setRows(songs_);
+        ++catalogRevision_;
+        databaseRevision_ = result.databaseRevision;
+        lastCatalogHydratedRows_ = result.hydratedRows;
+        lastCatalogUsedDelta_ = result.usedDelta;
+        catalogDatabaseOrder_ = true;
+        ready_ = true;
         emit catalogChanged();
-        if (reloadAgain_) { reloadAgain_ = false; reload(); }
+        if (!retiredSongs.isEmpty())
+            QThreadPool::globalInstance()->start([rows = std::move(retiredSongs)]() mutable { rows.clear(); });
+        if (!retiredCovers.isEmpty())
+            QThreadPool::globalInstance()->start([covers = std::move(retiredCovers)]() mutable { covers.clear(); });
+        if (!retiredCoverIdentities.isEmpty())
+            QThreadPool::globalInstance()->start([identities = std::move(retiredCoverIdentities)]() mutable { identities.clear(); });
+        libraryReloadActive_ = false;
+        if (reloadAgain_) {
+            const bool allowDelta = !reloadAgainForceFull_;
+            reloadAgain_ = false;
+            reloadAgainForceFull_ = false;
+            scheduleReload(allowDelta);
+        }
     });
     for(const auto& word:QJsonDocument::fromJson(QByteArray::fromStdString(database_.getSetting("search.history").value_or("[]"))).array()) searchHistory_.append(word.toString());
     initializeEmbeddedLyrics();
@@ -295,20 +416,35 @@ QString PortableSession::mediaFormat() const {
     return suffix.isEmpty()?QStringLiteral("音频"):suffix;
 }
 
-void PortableSession::reload() {
-    if (libraryReloadActive_) { reloadAgain_ = true; return; }
+void PortableSession::reload() { scheduleReload(false); }
+
+void PortableSession::reloadCatalogChanges() { scheduleReload(true); }
+
+void PortableSession::scheduleReload(bool allowDelta) {
+    if (libraryReloadActive_) {
+        reloadAgain_ = true;
+        reloadAgainForceFull_ |= !allowDelta;
+        return;
+    }
     libraryReloadActive_=true;
     const auto path = databasePath_;
-    libraryLoad_.setFuture(QtConcurrent::run([path] {
+    const auto previousSongs = songs_;
+    const auto retainedCoverIdentities = indexedCoverIdentities_;
+    const auto baseCatalogRevision = catalogRevision_;
+    const auto baseDatabaseRevision = databaseRevision_;
+    const bool deltaEligible = allowDelta && ready_ && catalogDatabaseOrder_ && baseDatabaseRevision >= 0;
+    libraryLoad_.setFuture(QtConcurrent::run([path, previousSongs, retainedCoverIdentities, baseCatalogRevision,
+                                              baseDatabaseRevision, deltaEligible] {
         infrastructure::database::Database db;
         LibraryLoadResult result;
+        result.baseCatalogRevision = baseCatalogRevision;
         if (!db.openExisting(path)) return result;
-        result.tracks = db.loadTracks();
         // Repair the old tag-save bug once, off the GUI thread. Only missing
         // relations are restored; audio files and existing metadata stay intact.
         if (db.getSetting("library.metadataRelationsVersion").value_or("") != "1") {
+            auto values = db.loadTracks();
             infrastructure::library::TagLibMetadataReader reader;
-            for (auto& track : result.tracks) {
+            for (auto& track : values) {
                 if (!track.localPath || (!track.artists.empty() && track.album)) continue;
                 const auto mediaPath = QString::fromStdString(*track.localPath);
                 if (!QFileInfo(mediaPath).isFile()) continue;
@@ -327,8 +463,122 @@ void PortableSession::reload() {
                     else it = result.repaired.erase(it);
                 }
             } else result.repaired.clear();
-            result.tracks = db.loadTracks();
         }
+        // A committed write transaction lists the IDs whose projected rows
+        // may have changed. Keep sparse hydration and all map work on this
+        // worker. Structural edits still use the full, database-ordered path.
+        if (deltaEligible && !previousSongs.isEmpty()) {
+            infrastructure::database::CatalogDelta delta;
+            constexpr std::size_t maxChangedRows = 256;
+            const bool deltaRead = db.readCatalogDelta(baseDatabaseRevision, maxChangedRows, delta);
+            if (deltaRead && !delta.requiresFullReload &&
+                delta.state.revision == baseDatabaseRevision && delta.changes.empty()) {
+                result.databaseRevision = delta.state.revision;
+                result.noChanges = true;
+                result.valid = true;
+                return result;
+            }
+            if (deltaRead && !delta.requiresFullReload &&
+                delta.state.revision > baseDatabaseRevision && !delta.changes.empty()) {
+                QHash<QString, qsizetype> indexedRows;
+                if (delta.changes.size() > 4) {
+                    indexedRows.reserve(previousSongs.size());
+                    for (qsizetype row = 0; row < previousSongs.size(); ++row)
+                        indexedRows.insert(previousSongs.at(row).toMap().value("trackId").toString(), row);
+                }
+                QVector<QPair<int, QVariantMap>> updates;
+                bool sameOrder = true;
+                for (const auto& change : delta.changes) {
+                    if (!change.track) { sameOrder = false; break; }
+                    const auto id = s(change.trackId);
+                    qsizetype row = indexedRows.isEmpty() ? -1 : indexedRows.value(id, -1);
+                    if (indexedRows.isEmpty()) {
+                        for (qsizetype candidate = 0; candidate < previousSongs.size(); ++candidate) {
+                            if (previousSongs.at(candidate).toMap().value("trackId").toString() == id) {
+                                row = candidate;
+                                break;
+                            }
+                        }
+                    }
+                    if (row < 0 || row >= previousSongs.size()) { sameOrder = false; break; }
+                    const auto before = previousSongs.at(row).toMap();
+                    const auto after = toMap(*change.track);
+                    if (before.value("trackId") != after.value("trackId") ||
+                        before.value("title") != after.value("title")) {
+                        sameOrder = false;
+                        break;
+                    }
+                    if (before != after) updates.append({static_cast<int>(row), after});
+                }
+                if (sameOrder) {
+                    result.songs = previousSongs;
+                    std::sort(updates.begin(), updates.end(), [](const auto& left, const auto& right) {
+                        return left.first < right.first;
+                    });
+                    for (const auto& [row, value] : updates) {
+                        result.songs[row] = value;
+                        result.changedTrackRows.append(row);
+                    }
+                    CatalogAggregates aggregates;
+                    for (const auto& value : result.songs) aggregates.add(value.toMap());
+                    aggregates.finish(result.albums, result.artists, retainedCoverIdentities,
+                                      result.coverCandidates, result.coverIdentities);
+                    result.databaseRevision = delta.state.revision;
+                    result.hydratedRows = static_cast<qsizetype>(delta.changes.size());
+                    result.sameTrackOrder = true;
+                    result.usedDelta = true;
+                    result.valid = true;
+                    return result;
+                }
+            }
+        }
+        // Hydrate one complete track at a time, immediately project it, and
+        // keep only the published maps. The model still changes on the GUI
+        // thread, while the worker avoids a second full domain catalog.
+        CatalogAggregates aggregates;
+        const auto project = [&](domain::Track&& track) {
+            const auto row = toMap(track);
+            result.songs.append(row);
+            aggregates.add(row);
+        };
+        infrastructure::database::CatalogSnapshotState snapshotState;
+        if (!db.forEachTrackWithRevision(project, snapshotState)) {
+            // A failed stream may have projected a partial catalog. Retry in a
+            // fresh SQLite read transaction; never publish loadTracks()'s
+            // separate, potentially mixed-generation relation queries.
+            result.songs.clear();
+            aggregates = {};
+            if (!db.forEachTrackWithRevision(project, snapshotState)) return result;
+        }
+        result.databaseRevision = snapshotState.revision;
+        result.hydratedRows = result.songs.size();
+        aggregates.finish(result.albums, result.artists, retainedCoverIdentities,
+                          result.coverCandidates, result.coverIdentities);
+        // All mapping and comparison stays on the read worker. The database
+        // primary key guarantees unique track IDs; a missing ID or changed
+        // order needs a structural model update and takes the reset path.
+        if (!previousSongs.isEmpty() && previousSongs.size() == result.songs.size()) {
+            result.sameTrackOrder = true;
+            constexpr int maxChangedRows = 256;
+            for (qsizetype row = 0; row < result.songs.size(); ++row) {
+                const auto& before = previousSongs.at(row);
+                const auto& after = result.songs.at(row);
+                const auto beforeId = before.toMap().value("trackId").toString();
+                if (beforeId.isEmpty() || beforeId != after.toMap().value("trackId").toString()) {
+                    result.sameTrackOrder = false;
+                    break;
+                }
+                if (before != after) {
+                    result.changedTrackRows.append(static_cast<int>(row));
+                    if (result.changedTrackRows.size() > maxChangedRows) {
+                        result.sameTrackOrder = false;
+                        break;
+                    }
+                }
+            }
+            if (!result.sameTrackOrder) result.changedTrackRows.clear();
+        }
+        result.valid = true;
         return result;
     }));
 }
@@ -530,7 +780,11 @@ bool PortableSession::enqueueTrack(const QVariantMap& value, bool next) {
     cancelSmartMix(); mixAttempted_=false;
     auto map = value;
     if (map.value("localPath").toString().isEmpty() && map.value("rid").toString().isEmpty() && map.value("remoteUrl").toString().isEmpty() && map.value("radioId").toString().isEmpty()) return false;
-    const int existing=queueIndexFor(map);
+    const auto key = songKey(map);
+    // The three bulk paths start from an empty queue. Keep their duplicate
+    // check linear while preserving the existing lookup for ordinary actions.
+    if (batching_ && !next && batchSongKeys_.contains(key)) return true;
+    const int existing = batching_ && !next ? -1 : queueIndexFor(map);
     if(existing>=0) {
         const int current=navigation_.currentIndex();
         if(next && existing!=current) moveQueue(existing,existing<current?current:current+1);
@@ -546,11 +800,28 @@ bool PortableSession::enqueueTrack(const QVariantMap& value, bool next) {
     info.setDuration(map.value("durationMs", map.value("duration")).toLongLong());
     auto* track = new PlayListTrack(info);
     const bool firstEntry = navigation_.isEmpty();
+    const auto previousQueueSize = queueView_.size();
     entries_.insert(track, map);
     if (next && !navigation_.isEmpty()) navigation_.insertTrack(navigation_.currentIndex() + 1, track);
     else navigation_.addTrack(track);
-    syncQueue();
-    if (firstEntry) emit currentTrackChanged();
+    if (batching_) batchSongKeys_.insert(key);
+    // Ordinary additions are always at the tail. Keep the published list and
+    // model in step without rebuilding and resetting every existing row.
+    if (!batching_ && !next && queueModel_.rowCount() == previousQueueSize &&
+        navigation_.trackCount() == previousQueueSize + 1 &&
+        navigation_.track(navigation_.trackCount() - 1) == track) {
+        queueView_.append(map);
+        if (queueModel_.appendRow(map)) {
+            emit queueContentsChanged();
+            queueModel_.setCurrentIndex(navigation_.currentIndex());
+            saveQueue();
+            emit queueChanged();
+        } else {
+            queueView_.removeLast();
+            syncQueue();
+        }
+    } else syncQueue();
+    if (firstEntry && !batching_) emit currentTrackChanged();
     return true;
 }
 bool PortableSession::openTrack(const QVariantMap& value) {
@@ -559,6 +830,29 @@ bool PortableSession::openTrack(const QVariantMap& value) {
     const int index=queueIndexFor(value);
     if(index==navigation_.currentIndex()) { play(); return true; }
     return selectQueue(index, true);
+}
+bool PortableSession::replaceQueueWithList(const QVariantList& values, const QVariantMap& selectedTrack) {
+    const auto selectedKey = songKey(selectedTrack);
+    if (selectedKey.isEmpty()) return false;
+    bool containsSelection = false;
+    for (const auto& value : values) {
+        if (songKey(value.toMap()) == selectedKey) {
+            containsSelection = true;
+            break;
+        }
+    }
+    if (!containsSelection) return false;
+
+    radioRetries_ = 0;
+    clearQueue();
+    batchSongKeys_.clear();
+    batching_ = true;
+    for (const auto& value : values) enqueueTrack(value.toMap());
+    batching_ = false;
+    batchSongKeys_.clear();
+    syncQueue();
+    const int selectedIndex = queueIndexFor(selectedTrack);
+    return selectedIndex >= 0 && selectQueue(selectedIndex, true);
 }
 int PortableSession::queueIndexFor(const QVariantMap& track) const {
     const auto key=songKey(track);
@@ -614,11 +908,28 @@ bool PortableSession::removeFromQueue(int index) {
 bool PortableSession::moveQueue(int from, int to) {
     if (from < 0 || to < 0 || from >= navigation_.trackCount() || to >= navigation_.trackCount()) return false;
     cancelSmartMix(); mixAttempted_=false;
+    auto* movedTrack = navigation_.track(from);
+    const auto expectedEntry = entries_.value(movedTrack);
+    const auto oldViewRow = queueView_.value(from).toMap();
+    const auto oldModelRow = queueModel_.snapshotRows().value(from).toMap();
     navigation_.clearSelection(); navigation_.setSelected(navigation_.track(from)); navigation_.moveTracks(from, to); navigation_.clearSelection();
-    syncQueue(); return true;
+    // Qmmp may decline a move. Only publish a local row move when its actual
+    // destination and row count match the copies we moved from. The command
+    // still serializes the complete queue once, at its existing boundary.
+    const bool inSync = navigation_.track(to) == movedTrack &&
+        queueView_.size() == navigation_.trackCount() &&
+        queueModel_.rowCount() == queueView_.size() &&
+        oldViewRow == expectedEntry && oldModelRow == oldViewRow;
+    if (from != to && inSync && queueModel_.moveRow(from, to)) {
+        queueView_.move(from, to);
+        emit queueContentsChanged();
+        queueModel_.setCurrentIndex(navigation_.currentIndex());
+        saveQueue(); emit queueChanged();
+    } else syncQueue();
+    return true;
 }
 void PortableSession::clearQueue() { mediaReady_=false;invalidate(); navigation_.clear(); entries_.clear(); lyrics_.clear(); syncQueue(); emit currentTrackChanged(); emit lyricsChanged(); emit changed(); }
-void PortableSession::playAll(const QVariantList& values) { clearQueue(); batching_ = true; for (const auto& value : values) enqueueTrack(value.toMap()); batching_ = false; syncQueue(); if (!navigation_.isEmpty()) selectQueue(0); }
+void PortableSession::playAll(const QVariantList& values) { clearQueue(); batchSongKeys_.clear(); batching_ = true; for (const auto& value : values) enqueueTrack(value.toMap()); batching_ = false; batchSongKeys_.clear(); syncQueue(); if (!navigation_.isEmpty()) selectQueue(0); }
 void PortableSession::setPlaybackMode(const QString& requested) {
     const QString mode = (requested == "repeatAll" || requested == "LoopAll" || requested == "Sequential" || requested == "sequential") ? "listLoop" : (requested == "repeatOne" || requested == "LoopOne") ? "singleLoop" : requested == "Shuffle" ? "shuffle" : requested == "StopAfterCurrent" ? "stopAfterCurrent" : requested;
     if (mode != "listLoop" && mode != "singleLoop" && mode != "shuffle" && mode != "stopAfterCurrent") return;
@@ -658,7 +969,7 @@ void PortableSession::redirectDuplicates(const QVariantList& redirects) {
             currentChanged|=currentPath.compare(from.value("path").toString(),Qt::CaseInsensitive)==0;
         }
     }
-    syncQueue();reload();
+    syncQueue();reloadCatalogChanges();
     if(!duplicateResumeEntry_.isEmpty()) {
         const auto entry=std::exchange(duplicateResumeEntry_,QString{});
         if(currentTrack().value("entryId").toString()==entry && state()!="Playing" && state()!="Paused") {
@@ -682,11 +993,13 @@ void PortableSession::restoreQueue() {
     const auto raw = database_.getSetting("portable.queue");
     const auto state = raw ? QJsonDocument::fromJson(QByteArray::fromStdString(*raw)).object() : QJsonObject{};
     if (QString::fromStdString(database_.getSetting("playback.restorePosition").value_or("true")) == "true") resumePosition_=static_cast<qint64>(state.value("position").toDouble());
+    batchSongKeys_.clear();
     batching_ = true;
     const auto items=state.value("items").toArray();
     const auto selected=items.isEmpty()?QVariantMap{}:items[std::clamp(state.value("index").toInt(),0,int(items.size()-1))].toObject().toVariantMap();
     for (const auto& value : items) enqueueTrack(value.toObject().toVariantMap());
     batching_ = false;
+    batchSongKeys_.clear();
     if (!navigation_.isEmpty()) navigation_.setCurrent(std::max(0,queueIndexFor(selected)));
     setPlaybackMode(state.value("mode").toString("listLoop")); syncQueue();
     player_.setVolume(QString::fromStdString(database_.getSetting("player.volume").value_or("0.6")).toFloat());
@@ -705,7 +1018,10 @@ void PortableSession::sortTracks(const QString& column, const QString& order) {
         const auto left = a.toMap().value(column).toString(), right = b.toMap().value(column).toString();
         return descending ? QString::localeAwareCompare(left, right) > 0 : QString::localeAwareCompare(left, right) < 0;
     });
-    tracks_.setRows(songs_); emit catalogChanged();
+    tracks_.setRows(songs_);
+    catalogDatabaseOrder_ = false;
+    ++catalogRevision_;
+    emit catalogChanged();
 }
 void PortableSession::search(const QString& searchText) {
     query_ = searchText.trimmed(); searchPage_ = 1; searchTotal_ = -1;
@@ -968,7 +1284,13 @@ void PortableSession::fetchNeteaseComments(const QString& rid,const QString& ent
     });
 }
 int PortableSession::currentLyricIndex() const {
-    int result = -1; for (int i=0; i<lyrics_.size(); ++i) { if (lyrics_[i].toMap().value("timeMs").toLongLong() > position()) break; result=i; } return result;
+    // parseTimedLyrics publishes rows in timestamp order. The lyric cursor is
+    // queried on every progress update, including long word-timed tracks.
+    const auto next = std::upper_bound(lyrics_.cbegin(), lyrics_.cend(), position(),
+        [](qint64 value, const QVariant& row) {
+            return value < row.toMap().value("timeMs").toLongLong();
+        });
+    return static_cast<int>(next - lyrics_.cbegin()) - 1;
 }
 void PortableSession::setDynamicArtworkEnabled(bool enabled) {
     motionEnabled_ = enabled;
@@ -1107,7 +1429,7 @@ bool PortableSession::removeLibraryTrack(const QVariantMap& track,bool trashFile
         const int index=queueIndexFor(track);if(index>=0)removeFromQueue(index);
     }
     if(!database_.removeLocalTrack(path,!trashFile)){emit notice(QStringLiteral("资料库索引更新失败"));return false;}
-    reload();emit localLibraryChanged();return true;
+    reloadCatalogChanges();emit localLibraryChanged();return true;
 }
 QVariantMap PortableSession::readTrackTags(const QVariantMap& track) const {
     auto result=track;const auto path=track.value("localPath").toString();
@@ -1211,6 +1533,6 @@ bool PortableSession::saveTrackTags(const QVariantMap& track,const QVariantMap& 
     for(auto& row:entries_)if(songKey(row)==songKey(track))for(auto it=updated.begin();it!=updated.end();++it)row[it.key()]=it.value();
     syncQueue();if(songKey(currentTrack())==songKey(track)){loadLyrics(path);emit currentTrackChanged();}
     emit trackMetadataChanged(updated);
-    reload();return true;
+    reloadCatalogChanges();return true;
 }
 }

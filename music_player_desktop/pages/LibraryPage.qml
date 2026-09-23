@@ -2,6 +2,7 @@ pragma ComponentBehavior: Bound
 
 import QtQuick
 import QtQuick.Window
+import ListenFree.Native 1.0
 import "../components"
 
 Item {
@@ -14,6 +15,14 @@ Item {
     readonly property bool gridLayout: section === "artists" || (section === "albums" && albumGridLayout)
     property var tracksModel
     property string section: "albums"
+    // The proxy owns only source row indexes. Keep it detached when this
+    // cached page is showing another section or an unfiltered song list.
+    FilteredTrackModel {
+        id: filteredTracks
+        sourceTracks: page.section === "songs" && page.filterText.trim().length > 0
+                      ? page.tracksModel : null
+        filterText: page.filterText
+    }
     property int selectedAlbumIndex: 1
     property bool albumPositionRestored: false
     function restoreAlbumPosition() {
@@ -77,8 +86,8 @@ Item {
     property color transitionCollectionTint: AppTheme.accent
 
     signal openCollection(string kind, string title, color tint)
-    signal trackActivated(var track)
-    signal trackCommandRequested(string command, var track, int rowIndex)
+    signal trackActivated(var track, var playbackContext)
+    signal trackCommandRequested(string command, var track, int rowIndex, var playbackContext)
     signal trackSortRequested(string column, string order)
     signal collectionTransitionRequested(string kind, string title, color tint,
                                          rect frameRect, rect artworkRect, url artworkSource, var artworkItem)
@@ -88,13 +97,20 @@ Item {
         if (!term.length) return rows
         return rows.filter(row => fields.some(field => String(row[field] || "").toLocaleLowerCase().indexOf(term) >= 0))
     }
-    readonly property var albums: matching(catalog && catalog.albums ? catalog.albums : [], ["title"])
-    readonly property var artists: matching(catalog && catalog.artists ? catalog.artists : [], ["name"])
-    readonly property var songs: matching(catalog && catalog.songs ? catalog.songs : [], ["title", "artist", "album"])
+    readonly property var albums: page.visible && section === "albums"
+                                  ? matching(catalog && catalog.albums ? catalog.albums : [], ["title"]) : []
+    readonly property var artists: page.visible && section === "artists"
+                                   ? matching(catalog && catalog.artists ? catalog.artists : [], ["name"]) : []
+    readonly property bool usingTracksModel: section === "songs"
+                                             && tracksModel !== null && tracksModel !== undefined
+    readonly property var displayTracksModel: !usingTracksModel ? null
+                                                : filterText.trim().length > 0 ? filteredTracks : tracksModel
+    readonly property var songs: section !== "songs" || usingTracksModel ? []
+                                                                       : matching(catalog && catalog.songs ? catalog.songs : [], ["title", "artist", "album"])
     onAlbumsChanged: { restoreAlbumPosition(); Qt.callLater(syncAlbumWindow) }
     readonly property string sectionTitle: section === "songs" ? qsTr("歌曲")
                                                    : section === "artists" ? qsTr("艺术家") : qsTr("专辑")
-    readonly property string sectionCount: section === "songs" ? songs.length + qsTr(" 首歌曲")
+    readonly property string sectionCount: section === "songs" ? (usingTracksModel ? displayTracksModel.count : songs.length) + qsTr(" 首歌曲")
                                                    : section === "artists" ? artists.length + qsTr(" 位艺术家")
                                                    : albums.length + qsTr(" 张专辑")
 
@@ -182,13 +198,13 @@ Item {
         height: page.height - y - 18
         sourceComponent: SongTable {
         anchors.fill: parent
-        rows: page.songs
-        sourceModel: page.filterText.trim().length ? null : page.tracksModel
+        rows: page.usingTracksModel ? [] : page.songs
+        sourceModel: page.displayTracksModel
         scrollKey: "library.songs." + page.filterText
         darkMode: page.darkMode
-        onTrackActivated: function(row) { page.trackActivated(row) }
-        onCommandRequested: function(command, track, rowIndex) {
-            page.trackCommandRequested(command, track, rowIndex)
+        onTrackActivated: function(row, playbackContext) { page.trackActivated(row, playbackContext) }
+        onCommandRequested: function(command, track, rowIndex, playbackContext) {
+            page.trackCommandRequested(command, track, rowIndex, playbackContext)
         }
         onSortChanged: function(column, order) {
             page.trackSortRequested(column, order)
@@ -473,7 +489,7 @@ Item {
     Text {
         objectName: "localSearchEmpty"
         anchors.centerIn: parent
-        visible: page.filterText.trim().length > 0 && (page.section === "songs" ? !page.songs.length : page.section === "artists" ? !page.artists.length : !page.albums.length)
+        visible: page.filterText.trim().length > 0 && (page.section === "songs" ? (page.usingTracksModel ? page.displayTracksModel.count === 0 : !page.songs.length) : page.section === "artists" ? !page.artists.length : !page.albums.length)
         text: qsTr("没有找到“") + page.filterText + "”"
         color: AppTheme.textSecondary; font.family: AppTheme.fontFamily; font.pixelSize: 16
     }

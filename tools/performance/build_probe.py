@@ -64,7 +64,7 @@ while i<len(compile_args):
         i+=2;continue
     if arg!='-MD':result.append('-O1' if arg=='-O3' else arg)
     i+=1
-result+=['-I'+str(root/'src/app'),'-I'+str(probe)]
+result+=['-I'+str(root/'src/app'),'-I'+str(root/'src/qmlbridge'),'-I'+str(probe)]
 for module in ['QtCore','QtGui','QtQml','QtQmlModels','QtQuick']:
     result+=['-IF:/QT/6.11.2/mingw_64/include/'+module+'/6.11.2','-IF:/QT/6.11.2/mingw_64/include/'+module+'/6.11.2/'+module]
 env=dict(os.environ);env['PATH']='F:/QT/Tools/mingw1310_64/bin;F:/QT/6.11.2/mingw_64/bin;'+env['PATH']

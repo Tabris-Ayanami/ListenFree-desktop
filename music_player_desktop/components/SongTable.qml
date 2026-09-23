@@ -76,9 +76,9 @@ Item {
     readonly property real albumSpace: tight ? 0 : Math.max(115, width * .23)
 
 
-    signal trackActivated(var row)
+    signal trackActivated(var row, var playbackContext)
     signal sortChanged(string column, string order)
-    signal commandRequested(string command, var track, int rowIndex)
+    signal commandRequested(string command, var track, int rowIndex, var playbackContext)
 
     implicitHeight: header.height + (sourceModel !== null
                                      ? backendList.contentHeight : mockList.contentHeight)
@@ -132,6 +132,16 @@ Item {
             mockList.forceLayout()
             mockList.contentY = Math.max(0, Math.min(position, mockList.contentHeight - mockList.height))
         }
+    }
+
+    // Build the source-model snapshot only when the user chooses to switch
+    // playback to this list; ordinary enqueue actions keep their cheap path.
+    function playbackRows() {
+        if (sourceModel === null) return displayRows
+        if (typeof sourceModel.snapshotRows === "function") return sourceModel.snapshotRows()
+        const result = []
+        for (let i = 0; i < sourceModel.count; ++i) result.push(sourceModel.get(i))
+        return result
     }
 
     function cycleSort(column) {
@@ -200,13 +210,14 @@ Item {
             width: mockList.width; compact: table.tight
             rowIndex: index; track: table.displayRows[index] || ({})
             fallbackArtwork: table.fallbackArtwork
-            onActivated: table.trackActivated(track)
-            onCommandRequested: command => table.commandRequested(command,track,index)
+            onActivated: table.trackActivated(track, table)
+            onCommandRequested: command => table.commandRequested(command,track,index,table)
             onContextRequested: (mx,my) => table.openContext(mockRow,mx,my,index,track)
         }
     }
     ListView {
         id: backendList
+        objectName: "songTableBackendList"
         visible: table.sourceModel !== null
         anchors.left: parent.left; anchors.right: parent.right; anchors.top: header.bottom; anchors.bottom: parent.bottom
         clip: true; reuseItems: true
@@ -233,8 +244,8 @@ Item {
             rowIndex: index
             fallbackArtwork: table.fallbackArtwork
             track: ({ trackId: trackId, title: title, artist: artist, album: album, duration: duration, localPath: localPath, artwork: artwork, source: "Local" })
-            onActivated: table.trackActivated(track)
-            onCommandRequested: command => table.commandRequested(command,track,index)
+            onActivated: table.trackActivated(track, table)
+            onCommandRequested: command => table.commandRequested(command,track,index,table)
             onContextRequested: (mx,my) => table.openContext(backendRow,mx,my,index,track)
         }
     }
@@ -247,7 +258,7 @@ Item {
         playlistMode: table.playlistMode
         onCommandTriggered: function(command, contextData) {
             if (contextData)
-                table.commandRequested(command, contextData.track, contextData.rowIndex)
+                table.commandRequested(command, contextData.track, contextData.rowIndex, table)
         }
     }
 }

@@ -34,8 +34,8 @@ Item {
     signal searchRequested(string term, string platform)
     signal collectionRequested(var collection)
     signal collectionTransitionRequested(var collection, rect frameRect, rect artworkRect, url artworkSource, var artworkItem)
-    signal trackActivated(var track)
-    signal trackCommandRequested(string command, var track, int rowIndex)
+    signal trackActivated(var track, var playbackContext)
+    signal trackCommandRequested(string command, var track, int rowIndex, var playbackContext)
     Component.onCompleted: {
         updateRecommendations()
         if(catalog)catalog.refreshHome()
@@ -166,9 +166,9 @@ Item {
                                         required property var modelData
                                         required property int index
                                         width: preview.width-20; track: modelData; rowIndex: index; canvasText: true
-                                        onActivated: page.trackActivated(track)
-                                        onCommandRequested: command=>page.trackCommandRequested(command,track,index)
-                                        onContextRequested: (mx,my)=>{const p=mapToItem(page,mx,my);songMenu.openAt(p.x,p.y,{track:track,rowIndex:index})}
+                                        onActivated: page.trackActivated(track, preview.modelData.tracks || [])
+                                        onCommandRequested: command=>page.trackCommandRequested(command,track,index,preview.modelData.tracks || [])
+                                        onContextRequested: (mx,my)=>{const p=mapToItem(page,mx,my);songMenu.openAt(p.x,p.y,{track:track,rowIndex:index,rows:preview.modelData.tracks || []})}
                                     }
                                 }
                             }
@@ -224,8 +224,8 @@ Item {
                         CoverArt {
                             width: 156; height: 156; cornerRadius: 12; source: dailyCard.modelData.artwork || ""; sourcePixelSize: 256; showShadow: false
                             HoverHandler { cursorShape: Qt.PointingHandCursor }
-                            TapHandler { onTapped: page.trackActivated(dailyCard.modelData) }
-                            TapHandler { acceptedButtons: Qt.RightButton; onTapped: eventPoint=>{const p=dailyCard.mapToItem(page,eventPoint.position.x,eventPoint.position.y);songMenu.openAt(p.x,p.y,{track:dailyCard.modelData,rowIndex:dailyCard.index})} }
+                            TapHandler { onTapped: page.trackActivated(dailyCard.modelData, page.catalog ? page.catalog.dailyTracks : []) }
+                            TapHandler { acceptedButtons: Qt.RightButton; onTapped: eventPoint=>{const p=dailyCard.mapToItem(page,eventPoint.position.x,eventPoint.position.y);songMenu.openAt(p.x,p.y,{track:dailyCard.modelData,rowIndex:dailyCard.index,rows:page.catalog ? page.catalog.dailyTracks : []})} }
                         }
                         Text { width: parent.width; text: dailyCard.modelData.title || ""; color: AppTheme.canvasText; font.family: AppTheme.fontFamily; font.pixelSize: 14; font.weight: Font.DemiBold; elide: Text.ElideRight }
                         Text { width: parent.width; text: dailyCard.modelData.artist || ""; color: AppTheme.canvasSecondary; font.family: AppTheme.fontFamily; font.pixelSize: 12; elide: Text.ElideRight }
@@ -257,5 +257,5 @@ Item {
         }
     }
     ScrollPosition { id: scrollPosition; view: scroll; key: "discover" }
-    SongContextMenu { id: songMenu; anchors.fill: parent; onCommandTriggered: (command,data)=>page.trackCommandRequested(command,data.track,data.rowIndex) }
+    SongContextMenu { id: songMenu; anchors.fill: parent; onCommandTriggered: (command,data)=>page.trackCommandRequested(command,data.track,data.rowIndex,data.rows || []) }
 }
