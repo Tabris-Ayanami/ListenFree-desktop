@@ -19,6 +19,8 @@ python tools/performance/measure.py build/performance-optimization/cases/accepta
 
 `build_probe.py --link-only` 仅适用于入口和探针头文件均未改变、只重建了 QML/应用对象的情况。诊断 EXE 位于 `build/performance-optimization/runtime`，正常产品 EXE 位于 `build/performance-verify`；不要将诊断 EXE 用作便携交付。
 
+旧的 `dist/ListenFree-Portable` 不存在时，可用 `--runtime-source dist/releases/<批次>/<运行目录>` 指定匹配的已有运行库；`--runtime` 仍是诊断输出目录。详情生命周期场景支持 `collectionFixture`（`count` 控制临时行数）和 `closeCollection`；快照的 `collectionDetailRows` / `collectionDetailBusy` 记录真正的后端持有量。该夹具模拟已加载详情，不保存歌单、不发真实在线分页请求；网络取消由原生 CollectionTests 单独验证。
+
 ## 场景与口径
 
 - `acceptance-1/2/3`：各自冷启动 30 秒、普通播放、普通歌词页、全屏莫奈、退出回落。默认 threaded 渲染循环，开始前确认 Windows 已解锁。
@@ -50,6 +52,10 @@ python tools/check_background_resources.py build/performance-optimization/result
 
 `expectedLyricLines: 89` 在进入歌词页前核对原生歌词负载；空歌词直接以退出码 10 拒绝，不能将该轮低占用当作优化收益。测试从隔离的空队列打开曲目，并清空隔离资料库中的待写标签任务，避免执行用户未完成的元数据写入。
 
+曲库场景可在步骤中指定 `expectedCatalogRows`，同时核对 ready、歌曲总数与原生模型行数；不符时以退出码 10 拒绝。快照中的 `catalogRows`、`catalogModelRows`、`catalogAlbums`、`catalogArtists` 用于核对前后负载，避免将歌曲未加载完整算作内存收益。
+
+`editor` 步骤通过 `open` 和可选 `track` 控制隔离编辑器夹具；快照记录 `editorControlsLoaded`、`editorItems` 及 `editorActionMs`。后者只测属性更新/创建控件的同步执行耗时，不能作为首帧延迟或 FPS。截图步骤与正式内存采样分开运行。
+
 `hidden-lyrics-return` 使用暂停的固定 50000ms 位置，对比返回后 0/16/50/100/250/2500ms 完整画面；`tools/check_hidden_lyric_pixels.py` 要求最大通道差不超过 2/255。该密集读回只验证画面，不用于前台内存或帧时间。
 
 最终证据使用 `final-acceptance-1/2/3`、`matched-acceptance-stress-baseline/optimized`、`foreground-browsing-baseline/verified`。浏览验收还检查回落阶段没有额外导航/切歌。运行期间保持测试窗口自动执行，避免向测试窗口输入额外操作；Windows 前台锁定可能阻止程序激活，需查看实际前台采样，而不是只相信 requestActivate/SetForegroundWindow 的调用。此次经用户授权临时调整的电源、屏保和前台锁定等待均已恢复。
@@ -72,3 +78,19 @@ python tools/performance/summarize_online.py docs/validation/performance-optimiz
 探针新增音源加载状态、解析成功/失败计数、曲目身份、音频格式、歌词负载及队列大小。`summarize_online.py` 要求音源已加载、在线身份正确且解码进度持续推进，分别输出主程序、SourceHost 和控制台宿主的 PWS / WS / Commit。只有返回音频 URL、不实际解码，或者中途变成本地歌曲，均不能通过。
 
 `ignoreUserInput` 仅在诊断窗口过滤外部鼠标/键盘事件，避免额外操作改变场景，不改变产品输入或视觉代码。`run_online.py --manage-foreground` 只在用户已授权调整测试设置时使用；临时屏保和前台锁定设置在 `finally` 恢复并核验，原值及恢复记录落盘。已有采样器的临时防休眠租约随进程退出解除。
+
+`lyricPreviewFixture: true` 为歌词匹配弹窗注入隔离合成控制器，便于排除在线波动，测量完整应用中预览界面的创建和关闭。`lyricPreview` 动作以 `count` 指定完整预览行数（默认 240，含换行、翻译和罗马音）；`lyricPreviewClose` 走原弹窗关闭入口。快照记录 `lyricMatchVisible`、`lyricPreviewItems`、`lyricPreviewRows` 和 `lyricPreviewCharacters`。该夹具只证明 UI 生命周期与完整进程树的对应变化，不代表真实来源缓存、网络请求或原生解析器的内存；后端取消、释放与缓存语义由 `listenfree_lyric_search_tests` 另测。
+
+## 下载历史和实际传输
+
+`download_memory.py prepare --profile <固定曲库.sqlite> --output <对照目录>` 生成 100/5,000 条合成历史的隔离数据库；`--sizes` 可覆盖规模。将匹配的诊断程序放到目录下的 `before-runtime` / `after-runtime` 后，运行 `download_memory.py run --output <对照目录>`，默认三轮交错执行两个版本。
+
+测量使用前台可见窗口；核对阶段末采样的实际前台状态，以及打开、滚动、关闭和重开的渲染帧。仅有 visible/exposed 为真不足以证明 Windows 上的遮挡窗口完成了动画；发生零帧、动画未完成或锁屏时，保留该次日志并排除重测。后台下载阶段没有界面变化时零帧正常。此脚本不修改系统前台锁定或电源设置。
+
+重测前先归档受影响的成对输出；例如 `run --sizes 5000 --start-round 2 --rounds 2` 只重跑 5,000 条历史的第 2、3 组，不覆盖已验收的第 1 组。脚本本身不自动归档同名输出。
+
+`run` 每个用例结束后还会校验窗口条件：阶段完整、正常退出、阶段末足量采样全部处于未锁屏的本应用前台、交互阶段有渲染帧；失败立即结束批次并关闭夹具。`verify --sizes 100 --rounds 3` 可以只读复核已有运行，不启动应用或 HTTP 服务。该入口只验窗口和退出条件；任务数量、传输字节、模型角色、恢复语义及画面仍需相应功能验收和完整结果校验。
+
+脚本在回环地址启动外部 HTTP 夹具，并生成只指向该地址的测试音源；应用使用真实 DownloadService、QNetworkReply、进度通知和文件写入。传输为有节奏的合成字节流，暂停后结束，不用于音频解码或标签正确性判断，服务端不计入应用进程树。已有原生下载测试另验 MP3 音频字节、续传、备用源和清理。脚本结束关闭服务；所有数据库、下载文件和脚本均在指定对照目录中。
+
+探针动作 `downloadAdd`、`downloadPanel`（`open`）、`downloadsPause`、`downloadsResume`、`downloadsClear` 调用原服务和面板。阶段结束才读取一次完整任务快照，周期采样不反复调用 tasks()；记录任务总数、首任务状态和字节数、列表行数、Item 数及进度通知计数。前后均包含同样的诊断开销。`visual --sizes 100 --rounds 1` 单独生成静态历史、滚动、关闭和重开的画面对照，不能将该截图运行的内存用于正式结果。

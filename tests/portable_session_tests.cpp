@@ -36,6 +36,7 @@
 #include <QTemporaryDir>
 #include <QTest>
 #include <QSignalSpy>
+#include <QAbstractItemModelTester>
 #include <qmmp/qmmp.h>
 #include <qmmp/soundcore.h>
 #include <qmmp/inputsource.h>
@@ -2325,6 +2326,51 @@ private slots:
         QCOMPARE(collections.detail().value("id"),collections.charts()[1].toMap().value("id"));
         QVERIFY(!collections.detail().value("tracks").toList().isEmpty());
     }
+    void downloadModelRestoresAndPreservesIdentity() {
+        using Download = qmlbridge::DownloadService;
+        infrastructure::database::Database db;
+        QVERIFY(db.open(temporary_.filePath("download-model.sqlite"))); QVERIFY(db.migrate());
+        QVariantList saved;
+        for (const auto &state : {"completed", "downloading", "queued", "finalizing", "error"})
+            saved.append(QVariantMap{{"id",QString::fromLatin1(state)}, {"state",QString::fromLatin1(state)},
+                {"title",QStringLiteral("History")}, {"received",qint64(5) * 1024 * 1024 * 1024},
+                {"track",QVariantMap{{"trackId",QString::fromLatin1(state)}}}});
+        QVERIFY(db.setSetting("downloads.v1", QString::fromUtf8(QJsonDocument(QJsonArray::fromVariantList(saved)).toJson())));
+        infrastructure::database::SettingsRepository repo(db);
+        qmlbridge::SettingsController settings(repo); settings.setValue("download.enabled",true);
+        settings.setValue("download.tryAlternateSource",false);
+        qmlbridge::SourceController source(&repo);
+        Download downloads(db,source,settings);
+        auto* model=downloads.taskModel();
+        QAbstractItemModelTester tester(model,QAbstractItemModelTester::FailureReportingMode::QtTest);
+        QCOMPARE(model->rowCount(),5);
+        QCOMPARE(model->rowCount(model->index(0,0)),0);
+        QVERIFY(!model->data(QModelIndex(),Download::TitleRole).isValid());
+        QCOMPARE(model->data(model->index(0,0),Download::ReceivedRole).toLongLong(),qint64(5)*1024*1024*1024);
+        QCOMPARE(model->data(model->index(1,0),Download::StateRole).toString(),QString("paused"));
+        QCOMPARE(model->data(model->index(2,0),Download::StateRole).toString(),QString("paused"));
+        QCOMPARE(model->data(model->index(3,0),Download::StateRole).toString(),QString("completed"));
+        QSignalSpy reset(model,&QAbstractItemModel::modelReset), updated(model,&QAbstractItemModel::dataChanged);
+        QSignalSpy inserted(model,&QAbstractItemModel::rowsInserted), removed(model,&QAbstractItemModel::rowsRemoved);
+        QPersistentModelIndex anchored(model->index(4,0));
+        downloads.add({QVariantMap{{"trackId","new"},{"rid","7"},{"title","New"}}});
+        QCOMPARE(model->rowCount(),6); QCOMPARE(inserted.size(),1);
+        QCOMPARE(anchored.row(),5); QCOMPARE(anchored.data(Download::TaskIdRole).toString(),QString("error"));
+        const auto id=model->data(model->index(0,0),Download::TaskIdRole).toString();
+        downloads.pause(id); QCOMPARE(model->data(model->index(0,0),Download::StateRole).toString(),QString("paused"));
+        downloads.resume(id); downloads.cancel(id);
+        QCOMPARE(model->data(model->index(0,0),Download::StateRole).toString(),QString("cancelled"));
+        downloads.deleteFile("completed");
+        QCOMPARE(removed.size(),1); QCOMPARE(anchored.row(),4);
+        QCOMPARE(anchored.data(Download::TaskIdRole).toString(),QString("error"));
+        QCOMPARE(reset.size(),0);
+        downloads.clearRecords(); QVERIFY(downloads.tasks().isEmpty()); QVERIFY(!anchored.isValid());
+        QCOMPARE(model->rowCount(),0); QCOMPARE(removed.size(),2);
+        const auto updatesAtClear=updated.size();
+        QTest::qWait(350); QCOMPARE(updated.size(),updatesAtClear);
+        downloads.clearRecords(); QCOMPARE(removed.size(),2);
+        QCOMPARE(QJsonDocument::fromJson(QByteArray::fromStdString(db.getSetting("downloads.v1").value())).array().size(),0);
+    }
     void downloadRangeAndAlternateSource() {
         QFile fixture(mp3_);QVERIFY(fixture.open(QIODevice::ReadOnly));const auto bytes=fixture.readAll();QVERIFY(bytes.size()>200000);
         QTcpServer server;QVERIFY(server.listen(QHostAddress::LocalHost));
@@ -2357,12 +2403,23 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(source.sources().last().toMap().value("hostReady").toBool(),10000);
         QVERIFY(source.importLocalFile(script("range-bad.js",false)));QTRY_VERIFY_WITH_TIMEOUT(source.sources().last().toMap().value("hostReady").toBool(),10000);const auto original=source.activeId();
         qmlbridge::DownloadService downloads(db,source,settings);
+        auto* model=downloads.taskModel();
+        QAbstractItemModelTester tester(model,QAbstractItemModelTester::FailureReportingMode::QtTest);
+        QSignalSpy reset(model,&QAbstractItemModel::modelReset), updated(model,&QAbstractItemModel::dataChanged);
         for(int pass=0;pass<2;++pass) {
             ignoreRange=pass==1;ranges.clear();
             downloads.add({QVariantMap{{"rid",QString::number(pass+1)},{"title","Range fixture"}}});
             const auto id=downloads.tasks().first().toMap().value("id").toString();
             QTRY_VERIFY_WITH_TIMEOUT(downloads.tasks().first().toMap().value("received").toLongLong()>100000,15000);
+            const QPersistentModelIndex first(model->index(0,0));
+            updated.clear();
+            QTRY_VERIFY_WITH_TIMEOUT(std::any_of(updated.cbegin(),updated.cend(),[](const QList<QVariant>& args){
+                return args.at(2).value<QList<int>>()==QList<int>{qmlbridge::DownloadService::ReceivedRole,qmlbridge::DownloadService::TotalRole};
+            }),5000);
+            QVERIFY(first.isValid());
+            QCOMPARE(first.data(qmlbridge::DownloadService::TaskIdRole).toString(),id);
             downloads.pause(id);const auto paused=downloads.tasks().first().toMap();QCOMPARE(paused.value("state").toString(),QString("paused"));
+            QCOMPARE(first.data(qmlbridge::DownloadService::StateRole).toString(),QString("paused"));
             const auto partial=paused.value("partial").toString();QVERIFY(QFileInfo(partial).size()>0);
             const auto pausedSize=QFileInfo(partial).size();QTest::qWait(100);QCOMPARE(QFileInfo(partial).size(),pausedSize);
             downloads.resume(id);QTRY_VERIFY_WITH_TIMEOUT(downloads.tasks().first().toMap().value("state")=="completed",25000);
@@ -2375,11 +2432,26 @@ private slots:
             const auto audio=bytes.sliced(before.firstFrameOffset(),before.lastFrameOffset()-before.firstFrameOffset());
             QCOMPARE(actual.sliced(after.firstFrameOffset(),after.lastFrameOffset()-after.firstFrameOffset()),audio);
             downloads.clearRecords();QVERIFY(QFile::exists(path));
+            QVERIFY(!first.isValid()); QCOMPARE(model->rowCount(),0); QCOMPARE(reset.size(),0);
         }
         downloads.add({QVariantMap{{"rid","3"},{"title","Cancel fixture"}}});
         QTRY_VERIFY_WITH_TIMEOUT(downloads.tasks().first().toMap().value("received").toLongLong()>100000,15000);
         const auto row=downloads.tasks().first().toMap();downloads.cancel(row.value("id").toString());
         QCOMPARE(downloads.tasks().first().toMap().value("state").toString(),QString("cancelled"));QVERIFY(!QFile::exists(row.value("partial").toString()));
+        downloads.clearRecords();
+        // A clear during finalization must not notify a removed row or restore it.
+        bool clearedWhileFinalizing=false;
+        connect(model,&QAbstractItemModel::dataChanged,&downloads,[&](const QModelIndex& first){
+            if (!clearedWhileFinalizing && first.data(qmlbridge::DownloadService::StateRole).toString()=="finalizing") {
+                clearedWhileFinalizing=true; downloads.clearRecords();
+            }
+        });
+        QSignalSpy completed(&downloads,&qmlbridge::DownloadService::fileCompleted);
+        downloads.add({QVariantMap{{"rid","4"},{"title","Clear while finalizing"}}});
+        QTRY_COMPARE_WITH_TIMEOUT(completed.size(),1,25000);
+        QVERIFY(clearedWhileFinalizing); QCOMPARE(model->rowCount(),0);
+        QVERIFY(downloads.tasks().isEmpty()); QVERIFY(QFile::exists(completed.first().first().toString()));
+        QCOMPARE(reset.size(),0);
     }
     void realDownloadAndClearKeepsAudio() {
         infrastructure::database::Database db;QVERIFY(db.open(temporary_.filePath("download.sqlite")));QVERIFY(db.migrate());

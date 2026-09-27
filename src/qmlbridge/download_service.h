@@ -2,6 +2,7 @@
 #include "controllers.h"
 #include "infrastructure/database/database.h"
 #include "source_controller.h"
+#include <QAbstractListModel>
 #include <QFile>
 #include <QFutureWatcher>
 #include <QPointer>
@@ -9,15 +10,22 @@
 #include <memory>
 
 namespace listenfree::qmlbridge {
-class DownloadService final : public QObject {
+class DownloadService final : public QAbstractListModel {
   Q_OBJECT
   Q_PROPERTY(QVariantList tasks READ tasks NOTIFY changed)
+  Q_PROPERTY(QAbstractItemModel *taskModel READ taskModel CONSTANT)
 public:
+  enum Role { TaskIdRole = Qt::UserRole + 1, TitleRole, ArtistRole,
+              ArtworkRole, StateRole, ReceivedRole, TotalRole, ErrorRole };
   DownloadService(infrastructure::database::Database &db,
                   SourceController &source, SettingsController &settings,
                   QObject *parent = nullptr);
   ~DownloadService() override;
   QVariantList tasks() const;
+  QAbstractItemModel *taskModel() { return this; }
+  int rowCount(const QModelIndex &parent = {}) const override;
+  QVariant data(const QModelIndex &index, int role) const override;
+  QHash<int, QByteArray> roleNames() const override;
   Q_INVOKABLE QVariantList specifications(const QVariantList &tracks) const;
   Q_INVOKABLE void add(const QVariantList &tracks,
                        const QString &quality = "128k");
@@ -46,6 +54,8 @@ private:
     QFile file;
     qint64 offset{0};
     bool checked{false};
+    int row{-1};
+    bool progressPending{false};
   };
   infrastructure::database::Database &db_;
   SourceController &source_;
@@ -53,8 +63,11 @@ private:
   QNetworkAccessManager network_;
   QList<std::shared_ptr<Task>> jobs_;
   QTimer update_;
+  QList<std::weak_ptr<Task>> progressUpdates_;
   std::shared_ptr<Task> find(const QString &id) const;
-  void persist();
+  void persist(const std::shared_ptr<Task> &task = {});
+  void notifyTask(const std::shared_ptr<Task> &task);
+  void flushProgress();
   void resolutionFailed(const std::shared_ptr<Task> &task,
                         const QString &reason);
   void pump();

@@ -206,9 +206,13 @@ Item {
     property url selectedCollectionArtwork: ""
     property var selectedCollectionRows: []
     function releaseInactiveCollectionRows() {
-        if (currentRoute.indexOf("detail/") !== 0 && !collectionMorphClosing
-                && selectedCollectionRows && selectedCollectionRows.length)
+        if (collectionMorphClosing) return
+        if (currentRoute.indexOf("detail/") !== 0 && selectedCollectionRows && selectedCollectionRows.length)
             selectedCollectionRows = []
+        const usesDetail = currentRoute === "detail/playlist"
+            || (currentRoute === "detail/album" && selectedOnlineCollection)
+        if (!usesDetail && playlistController && typeof playlistController.releaseDetail === "function")
+            playlistController.releaseDetail()
     }
     property string previousRoute: "library/albums"
     property bool selectedOnlineCollection: false
@@ -230,7 +234,8 @@ Item {
 
     signal routeChanged(string route)
 
-    readonly property int sidebarWidth: sidebarCollapsed ? 76 : 233
+    readonly property int sidebarWidth: sidebarCollapsed ? 76 : 216
+    readonly property int sidebarContentOffset: sidebarCollapsed ? 0 : -4
     readonly property bool canNavigateBack: settingsOpen
                                                  || currentRoute.indexOf("detail/") === 0
                                                  || currentRoute === "search"
@@ -750,7 +755,7 @@ Item {
         id: appSurface
         enabled: !equalizerPopup.visible && !lyricsMatchPopup.visible && !(AppTheme.currentPopup && ["backgroundColorPicker", "backgroundWallpaperPicker", "playlistSharePopup"].indexOf(AppTheme.currentPopup.objectName) >= 0)
         anchors.fill: parent
-        radius: shell.hostWindow ? shell.hostWindow.cornerRadius : 8
+        radius: shell.hostWindow ? shell.hostWindow.cornerRadius : AppTheme.windowCornerRadius
         clip: true
         color: "transparent"
         border.width: 1 / Screen.devicePixelRatio
@@ -840,7 +845,7 @@ Item {
             id: sidebar
             enabled: !shell.nowPlayingOpen
             x: 12
-            y: 12
+            y: (AppTheme.toolbarHeight - AppTheme.toolbarControlHeight) / 2
             width: shell.sidebarWidth - 24
             spacing: 6
             Behavior on width { enabled: shell.captureView.length === 0; NumberAnimation { duration: AppTheme.duration(220); easing.type: Easing.InOutCubic } }
@@ -848,24 +853,24 @@ Item {
             Item {
                 id: brand
                 width: parent.width
-                height: 56
+                height: AppTheme.toolbarControlHeight
                 clip: true
                 IconGlyph {
                     objectName: "sidebarToggleGlyph"
-                    x: shell.sidebarCollapsed ? (parent.width - width) / 2 : 14
+                    x: shell.sidebarCollapsed ? (parent.width - width) / 2 : 14 + shell.sidebarContentOffset
                     anchors.verticalCenter: parent.verticalCenter
                     width: 22; height: 22
                     kind: "sidebar"
                     glyphColor: AppTheme.sidebarText
                 }
                 Image {
-                    x: 47
+                    x: 47 + shell.sidebarContentOffset
                     anchors.verticalCenter: parent.verticalCenter
                     source: Qt.resolvedUrl(AppTheme.canvasDark
                                            ? "assets/freeListen_wordmark.svg"
                                            : "assets/freeListen_wordmark_dark.svg")
                     width: 126
-                    height: 30
+                    height: AppTheme.toolbarControlHeight
                     opacity: shell.sidebarCollapsed ? 0 : 1
                     visible: !shell.sidebarCollapsed
                     fillMode: Image.PreserveAspectFit
@@ -904,7 +909,7 @@ Item {
                 border.color: shell.darkMode ? "#24ffffff" : "#50ffffff"
                 Behavior on color { ColorAnimation { duration: AppTheme.duration(100) } }
                 CoverArt {
-                    x: shell.sidebarCollapsed ? (queueDelegate.width - width) / 2 : 8
+                    x: shell.sidebarCollapsed ? (queueDelegate.width - width) / 2 : 8 + shell.sidebarContentOffset
                     Behavior on x { NumberAnimation { duration: AppTheme.duration(220); easing.type: Easing.InOutCubic } }
                     anchors.verticalCenter: parent.verticalCenter
                     width: 40
@@ -916,7 +921,7 @@ Item {
                             ? queueDelegate.trackData.artwork : ""
                 }
                 Column {
-                    x: 56
+                    x: 56 + shell.sidebarContentOffset
                     anchors.verticalCenter: parent.verticalCenter
                     width: Math.max(0, parent.width - 92)
                     spacing: 1
@@ -954,7 +959,7 @@ Item {
                 RoundIconButton {
                     objectName: "sidebarQueueRemove" + queueDelegate.rowIndex
                     anchors.right: parent.right
-                    anchors.rightMargin: 4
+                    anchors.rightMargin: 4 - shell.sidebarContentOffset
                     anchors.verticalCenter: parent.verticalCenter
                     diameter: 26
                     kind: "close"
@@ -1019,7 +1024,7 @@ Item {
             x: shell.sidebarWidth
             y: 0
             width: parent.width - shell.sidebarWidth
-            height: 58
+            height: AppTheme.toolbarHeight
             Behavior on x { enabled: shell.captureView.length === 0; NumberAnimation { duration: AppTheme.duration(220); easing.type: Easing.InOutCubic } }
             Behavior on width { enabled: shell.captureView.length === 0; NumberAnimation { duration: AppTheme.duration(220); easing.type: Easing.InOutCubic } }
             gradient: Gradient {
@@ -1068,7 +1073,7 @@ Item {
 
             Row {
                 anchors.right: parent.right
-                anchors.rightMargin: 10
+                anchors.rightMargin: AppTheme.normalWindowCornerRadius - closeWindowControl.width / 2 - 4
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 10
                 TopGlyph { objectName: "topDownloadButton"; selected: shell.downloadsOpen; kind: "download"; visible: { const r = shell.settingsController ? shell.settingsController.revision : 0; return shell.settingsController ? shell.settingsController.value("download.enabled", true) : false } onClicked: shell.downloadsOpen = !shell.downloadsOpen }
@@ -1101,6 +1106,7 @@ Item {
                         }
                     }
                     WindowTrafficButton {
+                        id: closeWindowControl
                         action: "close"
                         fillColor: "#ff5f57"
                         revealGlyph: topTrafficHover.hovered
@@ -1116,7 +1122,7 @@ Item {
 
             Item {
                 id: searchField
-                x: topBar.x + 60; y: 13
+                x: topBar.x + 60; y: (AppTheme.toolbarHeight - AppTheme.toolbarControlHeight) / 2
                 width: searchInput.activeFocus ? 244 : 210
                 height: searchCapsule.height; z: 21
                 property int suggestionIndex: -1
@@ -1137,7 +1143,7 @@ Item {
                     id: searchCapsule
                     objectName: "searchSuggestionCapsule"
                     width: searchField.width
-                    height: searchField.expanded ? 40 + Math.min(8,searchField.suggestions.length)*36 : 32
+                    height: searchField.expanded ? 40 + Math.min(8,searchField.suggestions.length)*36 : AppTheme.toolbarControlHeight
                     radius: 10; clip: true
                     color: searchInput.activeFocus ? "#ffffff" : shell.artworkCanvasActive ? "transparent" : searchField.expanded ? AppTheme.floatingSurface : AppTheme.actionSurface
                     border.width: searchInput.activeFocus ? 1 : 0
@@ -1162,7 +1168,7 @@ Item {
                             shadowOpacity: 0
                         }
                     }
-                    MouseArea { x: 0; y: 0; width: 32; height: 32; onClicked: searchField.submit()
+                    MouseArea { x: 0; y: 0; width: AppTheme.toolbarControlHeight; height: AppTheme.toolbarControlHeight; onClicked: searchField.submit()
                         IconGlyph { objectName: "integratedSearchIcon"; anchors.centerIn: parent; width: 14; height: 14; kind: "search"; glyphColor: searchInput.activeFocus ? "#20262b" : AppTheme.canvasText }
                     }
                     // The expanded field owns wheel/hit tests beneath the header.
@@ -1171,7 +1177,7 @@ Item {
                         id: searchInput
                         objectName: "globalSearchInput"
                         x: 33
-                        y: 0; width: searchCapsule.width-x-12; height: 32
+                        y: 0; width: searchCapsule.width-x-12; height: AppTheme.toolbarControlHeight
                         verticalAlignment: Text.AlignVCenter
                         color: activeFocus ? "#000000" : AppTheme.canvasText; font.family: AppTheme.fontFamily; font.pixelSize: 12; clip: true
                         selectionColor: "#c3dbff"; selectedTextColor: "#000000"
@@ -1212,7 +1218,7 @@ Item {
             id: contentLoader
             enabled: !shell.nowPlayingOpen
             x: shell.sidebarWidth
-            y: shell.artistCanvasActive ? 0 : 58
+            y: shell.artistCanvasActive ? 0 : AppTheme.toolbarHeight
             width: parent.width - shell.sidebarWidth
             height: parent.height - y
             Behavior on x { enabled: shell.captureView.length === 0; NumberAnimation { duration: AppTheme.duration(220); easing.type: Easing.InOutCubic } }
@@ -1272,7 +1278,7 @@ Item {
             y: shell.mix(floatingPlayer.y, 0, shell.morphProgress)
             width: shell.mix(floatingPlayer.width, appSurface.width, shell.morphProgress)
             height: shell.mix(floatingPlayer.height, appSurface.height, shell.morphProgress)
-            cornerRadius: shell.mix(floatingPlayer.collapsed ? 31 : 24, appSurface.radius, shell.morphProgress)
+            cornerRadius: shell.mix(floatingPlayer.cornerRadius, appSurface.radius, shell.morphProgress)
             backdrop: floatingPlayer.backdrop
             opaqueBackdropBase: false; frosted: true; backdropBlur: floatingPlayer.glassBlur
             tint: floatingPlayer.glassTint
@@ -1312,11 +1318,11 @@ Item {
             id: floatingPlayer
             artworkInTransition: shell.morphAnimating
             surfaceInTransition: shell.morphAnimating
-            expandedWidth: shell.width - 106
+            expandedWidth: shell.width - 2 * AppTheme.playerEdgeMargin
             backdrop: libraryBackdrop
             z: 90
-            x: (shell.playerCollapsed || shell.settingsOpen) ? 12 : 53
-            y: parent.height - floatingPlayer.height - 10
+            x: AppTheme.playerEdgeMargin
+            y: parent.height - floatingPlayer.height - AppTheme.playerEdgeMargin
             collapsed: shell.playerCollapsed || shell.settingsOpen
             playing: shell.playing
             accentColor: shell.accentColor
@@ -1349,7 +1355,7 @@ Item {
                     return shell.radioController.isFavorite(shell.displayedTrack)
                 }
                 if (!shell.playlistController) return false
-                const revision = shell.playlistController.playlists
+                const revision = shell.playlistController.likedTracksRevision
                 return shell.playlistController.isTrackLiked(shell.displayedTrack)
             }
             onFavoriteRequested: shell.handleTrackCommand("favorite",shell.displayedTrack,-1)
@@ -1361,7 +1367,6 @@ Item {
             onCycleModeRequested: if(shell.playerController)shell.playerController.cyclePlaybackMode()
             onMuteToggleRequested: if(shell.playerController)shell.playerController.toggleMute()
 
-            Behavior on x { enabled: shell.captureView.length === 0; NumberAnimation { duration: AppTheme.duration(240); easing.type: Easing.InOutCubic } }
         }
 
         Item {
@@ -1611,7 +1616,7 @@ Item {
 
         Text {
             id: sectionText
-            x: 8
+            x: 8 + shell.sidebarContentOffset
             anchors.verticalCenter: parent.verticalCenter
             color: AppTheme.sidebarSecondary
             opacity: shell.sidebarCollapsed ? 0 : .82
@@ -1670,7 +1675,7 @@ Item {
             }
         }
         IconGlyph {
-            x: shell.sidebarCollapsed ? 11 : 14
+            x: shell.sidebarCollapsed ? 11 : 14 + shell.sidebarContentOffset
             anchors.verticalCenter: parent.verticalCenter
             width: 20
             height: 20
@@ -1679,7 +1684,7 @@ Item {
             strokeWidth: 1.45
         }
         Text {
-            x: 47
+            x: 47 + shell.sidebarContentOffset
             anchors.verticalCenter: parent.verticalCenter
             width: parent.width - x - 8
             text: label
@@ -1695,7 +1700,7 @@ Item {
 
     component TopGlyph: RoundIconButton {
         property bool selected: false
-        diameter: 32
+        diameter: AppTheme.toolbarControlHeight
         // SVGs have different viewBox padding; keep their visible height close
         // to the 18 px window dots while preserving a 32 px pointer target.
         glyphSize: kind === "sun" ? 18 : kind === "gear" ? 22 : 23

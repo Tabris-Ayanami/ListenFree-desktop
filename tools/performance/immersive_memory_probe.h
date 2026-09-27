@@ -7,6 +7,8 @@
 #include <QQuickItem>
 #include <QQuickWindow>
 #include <QQmlProperty>
+#include <QQmlComponent>
+#include <QQmlContext>
 #include <QVideoFrame>
 #include <QJSValue>
 #include <QPointer>
@@ -46,7 +48,8 @@ inline QQuickItem* auditVisibleItem(QQuickItem* root,const QString& name,const Q
 }
 inline void runImmersiveMemoryProbe(QApplication& app,QQuickWindow* window,QObject* shell,
     listenfree::qmlbridge::PortableSession& player,listenfree::qmlbridge::SettingsController& settings,
-    listenfree::qmlbridge::ImmersiveController& service,listenfree::qmlbridge::SourceController& sources,const QStringList& args){
+    listenfree::qmlbridge::ImmersiveController& service,listenfree::qmlbridge::SourceController& sources,
+    listenfree::qmlbridge::CollectionService& collections,const QStringList& args){
     const int input=args.indexOf("--audit-config");
     if(input<0||input+1>=args.size()||!args.contains("--data-dir")){app.exit(9);return;}
     QFile configFile(args[input+1]);if(!configFile.open(QIODevice::ReadOnly)){app.exit(9);return;}
@@ -63,22 +66,71 @@ inline void runImmersiveMemoryProbe(QApplication& app,QQuickWindow* window,QObje
     }
     if(config["ignoreUserInput"].toBool())app.installEventFilter(new AuditInputGuard(&app));
     const QString report=config["report"].toString();
-    struct State{int next=0,frames=0,resolved=0,resolveErrors=0;QString stage;QElapsedTimer total,stageClock,frameClock;QVector<double> frameTimes;QMutex renderMutex;};
+    struct State{int next=0,frames=0,resolved=0,resolveErrors=0,downloadChanges=0,downloadRowChanges=0;double editorActionMs=0;QString stage;QElapsedTimer total,stageClock,frameClock;QVector<double> frameTimes;QMutex renderMutex;QPointer<QObject> lyricFixture;};
     auto state=std::make_shared<State>();state->total.start();state->frameClock.start();
+    auto* downloads=qobject_cast<listenfree::qmlbridge::DownloadService*>(qmlEngine(shell)->rootContext()->contextProperty("backendDownloads").value<QObject*>());
+    if(downloads){
+        QObject::connect(downloads,&listenfree::qmlbridge::DownloadService::changed,&app,[state]{++state->downloadChanges;});
+        if(auto* model=qobject_cast<QAbstractItemModel*>(downloads))
+            QObject::connect(model,&QAbstractItemModel::dataChanged,&app,[state]{++state->downloadRowChanges;});
+    }
+    // Synthetic data crosses the same QML controller interface as normal previews.
+    // This optional fixture measures UI ownership, not network/provider memory.
+    if(config["lyricPreviewFixture"].toBool()){
+        QQmlComponent fixture(qmlEngine(shell));
+        fixture.setData(R"qml(import QtQuick
+QtObject {
+ property var lyricCandidates: []
+ property var lyricMatchSources: []
+ property var lyricPreviewLines: []
+ property string lyricPreview: ""
+ property bool lyricMatchBusy: false
+ property string lyricMatchError: ""
+ function cancelLyricMatch() { lyricMatchBusy=false }
+ function releaseLyricMatch() { cancelLyricMatch();lyricCandidates=[];lyricMatchSources=[];lyricPreviewLines=[];lyricPreview="" }
+ function previewLyricMatch(index) {}
+})qml",QUrl());
+        state->lyricFixture=fixture.create();
+        if(!state->lyricFixture){qCritical()<<fixture.errors();app.exit(11);return;}
+        state->lyricFixture->setParent(shell);
+        shell->findChild<QObject*>("lyricsMatchPopup")->setProperty("controller",QVariant::fromValue(state->lyricFixture.data()));
+    }
     QObject::connect(&sources,&listenfree::qmlbridge::SourceController::resolutionFinished,&app,
         [state](const QString&,const QString&,const QString& action,const QVariantMap&,const QString& error){
             if(action=="musicUrl"){if(error.isEmpty())++state->resolved;else ++state->resolveErrors;}
         });
     auto* timer=new QTimer(&app);timer->setSingleShot(true);
     QObject::connect(window,&QQuickWindow::afterRendering,&app,[state]{QMutexLocker lock(&state->renderMutex);++state->frames;state->frameTimes.append(state->frameClock.nsecsElapsed()/1e6);state->frameClock.restart();},Qt::DirectConnection);
-    const auto snapshot=[&,window,shell,state,report,inspectObjects=config.value("inspectObjects").toBool(true)](QString label){
+    const auto snapshot=[&,window,shell,state,downloads,report,inspectObjects=config.value("inspectObjects").toBool(true)](QString label){
         QVector<double> frameTimes;int frames=0;
         {QMutexLocker lock(&state->renderMutex);frameTimes=state->frameTimes;frames=state->frames;}
         auto* page=auditItem(window->contentItem(),"nowPlayingPage");
         auto* stage=auditItem(window->contentItem(),"immersiveStage");
         auto* pv=auditItem(window->contentItem(),"immersivePv");
         auto* disc=auditItem(window->contentItem(),"immersiveDiscQueue");
+        auto* editor=auditItem(window->contentItem(),"musicEditorDialog");
+        const auto countItems=[](auto&& self,QQuickItem* item)->int{
+            if(!item)return 0;
+            int count=1;for(auto* child:item->childItems())count+=self(self,child);return count;
+        };
+        auto* matchPopup=shell->findChild<QObject*>("lyricsMatchPopup");
+        auto* matchPreview=matchPopup?matchPopup->findChild<QQuickItem*>("lyricMatchPreview"):nullptr;
+        auto* downloadPanel=auditItem(window->contentItem(),"downloadPanel");
+        QQuickItem* downloadList=nullptr;
+        if(downloadPanel)for(auto* child:downloadPanel->childItems())if(child->inherits("QQuickListView"))downloadList=child;
         QJsonObject row{{"stage",state->stage},{"label",label},{"elapsedMs",state->total.elapsed()},
+            {"downloadsOpen",shell->property("downloadsOpen").toBool()},
+            {"downloadItems",countItems(countItems,downloadPanel)},
+            {"downloadViewRows",downloadList?downloadList->property("count").toInt():0},
+            {"downloadContentY",downloadList?downloadList->property("contentY").toDouble():0},
+            {"downloadChanges",state->downloadChanges},{"downloadRowChanges",state->downloadRowChanges},
+            {"lyricMatchVisible",matchPopup && matchPopup->property("visible").toBool()},
+            {"lyricPreviewItems",countItems(countItems,matchPreview)},
+            {"lyricPreviewRows",state->lyricFixture?auditVariant(state->lyricFixture->property("lyricPreviewLines")).toList().size():player.lyricPreviewLines().size()},
+            {"lyricPreviewCharacters",state->lyricFixture?state->lyricFixture->property("lyricPreview").toString().size():player.lyricPreview().size()},
+            {"editorOpen",shell->property("musicEditorOpen").toBool()},
+            {"editorControlsLoaded",editor && auditItem(editor,"musicEditorContent")!=nullptr},
+            {"editorItems",countItems(countItems,editor)},{"editorActionMs",state->editorActionMs},
             {"windowExposed",window->isExposed()},{"windowVisible",window->isVisible()},{"width",window->width()},{"height",window->height()},{"dpr",window->devicePixelRatio()},
             {"playback",player.state()},{"positionMs",player.position()},{"durationMs",player.duration()},
             {"trackPath",player.currentTrack().value("localPath").toString()},
@@ -89,11 +141,23 @@ inline void runImmersiveMemoryProbe(QApplication& app,QQuickWindow* window,QObje
             {"sourceHostState",sources.hostState()},{"activeSource",sources.activeId()},
             {"musicUrlSucceeded",state->resolved},{"musicUrlErrors",state->resolveErrors},
             {"nativeLyricLines",player.lyrics().size()},{"catalogReady",player.ready()},
+            {"catalogRows",player.songs().size()},{"catalogModelRows",player.tracksModel()->rowCount()},
+            {"catalogAlbums",player.albums().size()},{"catalogArtists",player.artists().size()},
+            {"collectionDetailRows",collections.detail().value("tracks").toList().size()},
+            {"collectionDetailBusy",collections.detailBusy()},
             {"immersive",bool(stage)},{"serviceActive",service.active()},{"sampling",service.sampling()},
             {"videoPlayer",service.videoPlayer()!=nullptr || service.nativeVideoPlayer()!=nullptr},{"videoReady",service.videoReady()},
             {"videoError",service.error()},{"videoTitle",service.videoTitle()},
             {"biliAuthenticated",QCoreApplication::instance()->property("auditBiliAuthenticated").toBool()},
             {"candidates",service.candidates().size()},{"frameCount",frames},{"stageMs",state->stageClock.elapsed()}};
+        // Full snapshots are confined to stage boundaries, never the periodic sampler.
+        if(downloads && label=="end"){
+            const auto tasks=downloads->tasks();row["downloadStoredRows"]=tasks.size();
+            if(!tasks.isEmpty()){
+                const auto first=tasks.first().toMap();row["downloadFirstState"]=first.value("state").toString();
+                row["downloadFirstBytes"]=QJsonValue::fromVariant(first.value("received"));
+            }
+        }
         QJsonArray sourceStatus;
         for(const auto& value:sources.sources()){
             const auto entry=value.toMap();
@@ -197,7 +261,7 @@ inline void runImmersiveMemoryProbe(QApplication& app,QQuickWindow* window,QObje
     };
     auto* periodic=new QTimer(&app);periodic->setInterval(5000);
     QObject::connect(periodic,&QTimer::timeout,&app,[snapshot]{snapshot("sample");});
-    QObject::connect(timer,&QTimer::timeout,&app,[&,window,shell,config,report,state,timer,periodic,snapshot]{
+    QObject::connect(timer,&QTimer::timeout,&app,[&,window,shell,config,report,state,downloads,timer,periodic,snapshot]{
         if(!state->stage.isEmpty())snapshot("end");
         const auto steps=config["steps"].toArray();
         if(state->next>=steps.size()){
@@ -211,6 +275,11 @@ inline void runImmersiveMemoryProbe(QApplication& app,QQuickWindow* window,QObje
         qInfo().noquote()<<"PERF_STAGE"<<state->stage;
         auto* page=auditItem(window->contentItem(),"nowPlayingPage");auto* stage=auditItem(window->contentItem(),"immersiveStage");
         const QString action=step["action"].toString();
+        if(step.contains("expectedCatalogRows") && (!player.ready() || player.songs().size()!=step["expectedCatalogRows"].toInt()
+                || player.tracksModel()->rowCount()!=step["expectedCatalogRows"].toInt())){
+            qCritical()<<"AUDIT workload mismatch: catalog"<<player.songs().size()<<"expected"<<step["expectedCatalogRows"].toInt();
+            snapshot("workload-failed");app.exit(10);return;
+        }
         if(step.contains("expectedLyricLines") && player.lyrics().size()!=step["expectedLyricLines"].toInt()){
             qCritical()<<"AUDIT workload mismatch: lyrics"<<player.lyrics().size()<<"expected"<<step["expectedLyricLines"].toInt();
             snapshot("workload-failed");app.exit(10);return;
@@ -286,10 +355,60 @@ inline void runImmersiveMemoryProbe(QApplication& app,QQuickWindow* window,QObje
             qInfo()<<"PERF_HEAP_OPTIMIZE"<<ok<<"ms"<<clock.elapsed();
 #endif
         }
+        else if(action=="downloadPanel"){shell->setProperty("downloadsOpen",step["open"].toBool());}
+        else if(action=="downloadAdd"){
+            if(!downloads){app.exit(11);return;}
+            settings.setValue("download.enabled",true);settings.setValue("download.embedContent.Lyrics",false);
+            settings.setValue("download.embedContent.Artwork",false);settings.setValue("download.tryAlternateSource",false);
+            settings.setValue("download.folder",QFileInfo(report).dir().filePath("audio"));
+            downloads->add({QVariantMap{{"trackId","download-audit"},{"source","kw"},{"rid","1"},
+                {"title",QStringLiteral("下载进度验证")},{"artist","Fixture Artist"}}});
+        }
+        else if(action=="downloadsPause"){if(downloads)downloads->pauseAll();}
+        else if(action=="downloadsResume"){if(downloads){const auto tasks=downloads->tasks();if(!tasks.isEmpty())downloads->resume(tasks.first().toMap().value("id").toString());}}
+        else if(action=="downloadsClear"){if(downloads)downloads->clearRecords();}
         else if(action=="stop"){player.stop();}
         else if(action=="releaseUi"){window->releaseResources();}
         else if(action=="collectQml"){if(auto* engine=qmlEngine(window))engine->collectGarbage();}
         else if(action=="clearQueue"){player.clearQueue();}
+        else if(action=="collectionFixture"){
+            QVariantList rows;
+            const int count=step["count"].toInt(5000);
+            for(int i=0;i<count;++i)rows.append(QVariantMap{{"trackId",QString("fixture:%1").arg(i)},
+                {"source","fixture"},{"rid",QString::number(i)},
+                {"title",QStringLiteral("内存验证歌曲 %1").arg(i)},
+                {"artist",QStringLiteral("验证艺术家 %1").arg(i%50)},
+                {"album",QStringLiteral("验证专辑 %1").arg(i/10)},
+                {"durationMs",180000},{"duration","03:00"}});
+            const QVariantMap card{{"id","memory-detail"},{"kind","Local"},{"title","内存验证歌单"},{"tracks",rows}};
+            QMetaObject::invokeMethod(shell,"openOnlineCollection",Q_ARG(QVariant,QVariant(card)));
+        }
+        else if(action=="editor"){
+            QElapsedTimer elapsed;elapsed.start();
+            if(step.contains("track"))shell->setProperty("musicEditorTrack",step["track"].toObject().toVariantMap());
+            shell->setProperty("musicEditorOpen",step["open"].toBool());
+            state->editorActionMs=elapsed.nsecsElapsed()/1e6;
+        }
+        else if(action=="lyricPreview"){
+            if(!state->lyricFixture){app.exit(11);return;}
+            QVariantList lines;
+            QString text;
+            for(int i=0;i<step["count"].toInt(240);++i){
+                const auto line=QStringLiteral("Preview line %1 — 测试歌词与多语言排版").arg(i+1);
+                lines.append(QVariantMap{{"timeMs",i*2000},{"text",line+(i%4==0?QStringLiteral("，这一行包含更长的文字，用来验证窄窗口内的自动换行与行间距。"):QString{})},
+                    {"translation",i%3==0?QStringLiteral("这是对应的翻译文本。"):QString{}},
+                    {"romanization",i%5==0?QStringLiteral("zhe shi luo ma yin yu lan"):QString{}}});
+                text+=QStringLiteral("[%1:%2.00]%3\n").arg(i*2/60,2,10,QChar('0')).arg(i*2%60,2,10,QChar('0')).arg(line);
+            }
+            state->lyricFixture->setProperty("lyricCandidates",QVariantList{QVariantMap{{"key","fixture:0"},{"title","Preview fixture"},{"artist","Test Artist"},{"score",100},{"sourceLabel","Fixture"},{"lyricSource","fixture"}}});
+            state->lyricFixture->setProperty("lyricPreview",text);
+            state->lyricFixture->setProperty("lyricPreviewLines",lines);
+            auto* popup=shell->findChild<QObject*>("lyricsMatchPopup");
+            popup->setProperty("selectedKey","fixture:0");
+            QMetaObject::invokeMethod(popup,"open");
+        }
+        else if(action=="lyricPreviewClose"){QMetaObject::invokeMethod(shell->findChild<QObject*>("lyricsMatchPopup"),"close");}
+        else if(action=="closeCollection"){QMetaObject::invokeMethod(shell,"closeCollection");}
         else if(action=="collection"){
             QMetaObject::invokeMethod(shell,"openCollection",Q_ARG(QVariant,step["kind"].toString()),
                 Q_ARG(QVariant,step["value"].toString()),Q_ARG(QVariant,QColor("#608070")));

@@ -62,7 +62,7 @@ bool active(const QString &state) {
 DownloadService::DownloadService(infrastructure::database::Database &db,
                                  SourceController &source,
                                  SettingsController &settings, QObject *parent)
-    : QObject(parent), db_(db), source_(source), settings_(settings) {
+    : QAbstractListModel(parent), db_(db), source_(source), settings_(settings) {
   const auto saved = QJsonDocument::fromJson(
                          QByteArray::fromStdString(
                              db_.getSetting("downloads.v1").value_or("[]")))
@@ -75,10 +75,11 @@ DownloadService::DownloadService(infrastructure::database::Database &db,
     if (active(task->data.value("state").toString()) ||
         task->data.value("state") == "queued")
       task->data["state"] = "paused";
+    task->row = int(jobs_.size());
     jobs_.append(task);
   }
   update_.setInterval(250);
-  connect(&update_, &QTimer::timeout, this, [this] { emit changed(); });
+  connect(&update_, &QTimer::timeout, this, &DownloadService::flushProgress);
   connect(&source_, &SourceController::resolutionFinished, this,
           [this](const QString &id, const QString &, const QString &,
                  const QVariantMap &data, const QString &error) {
@@ -106,9 +107,61 @@ DownloadService::~DownloadService() {
 }
 QVariantList DownloadService::tasks() const {
   QVariantList rows;
+  rows.reserve(jobs_.size());
   for (const auto &t : jobs_)
     rows.append(t->data);
   return rows;
+}
+int DownloadService::rowCount(const QModelIndex &parent) const {
+  return parent.isValid() ? 0 : int(jobs_.size());
+}
+QVariant DownloadService::data(const QModelIndex &index, int role) const {
+  if (!index.isValid() || index.model() != this || index.column() != 0 ||
+      index.row() < 0 || index.row() >= jobs_.size())
+    return {};
+  const auto &row = jobs_.at(index.row())->data;
+  switch (role) {
+  case TaskIdRole: return row.value(QStringLiteral("id")).toString();
+  case Qt::DisplayRole:
+  case TitleRole: return row.value(QStringLiteral("title")).toString();
+  case ArtistRole: return row.value(QStringLiteral("artist")).toString();
+  case ArtworkRole: return row.value(QStringLiteral("artwork")).toString();
+  case StateRole: return row.value(QStringLiteral("state")).toString();
+  case ReceivedRole: return row.value(QStringLiteral("received")).toLongLong();
+  case TotalRole: return row.value(QStringLiteral("total")).toLongLong();
+  case ErrorRole: return row.value(QStringLiteral("error")).toString();
+  default: return {};
+  }
+}
+QHash<int, QByteArray> DownloadService::roleNames() const {
+  return {{TaskIdRole,"taskId"}, {TitleRole,"title"}, {ArtistRole,"artist"},
+          {ArtworkRole,"artwork"}, {StateRole,"taskState"},
+          {ReceivedRole,"received"}, {TotalRole,"total"}, {ErrorRole,"errorMessage"}};
+}
+void DownloadService::notifyTask(const std::shared_ptr<Task> &task) {
+  task->progressPending = false;
+  // A tag writer can finish after the user cleared the history.
+  if (task->row < 0 || task->row >= jobs_.size() || jobs_.at(task->row) != task)
+    return;
+  const auto row = index(task->row, 0);
+  emit dataChanged(row, row);
+}
+void DownloadService::flushProgress() {
+  const auto pending = std::exchange(progressUpdates_, {});
+  bool updated = false;
+  for (const auto &weak : pending) {
+    const auto task = weak.lock();
+    if (!task || !task->progressPending)
+      continue;
+    task->progressPending = false;
+    if (task->row < 0 || task->row >= jobs_.size() || jobs_.at(task->row) != task)
+      continue;
+    const auto row = index(task->row, 0);
+    emit dataChanged(row, row, {ReceivedRole, TotalRole});
+    updated = true;
+  }
+  if (updated)
+    emit changed(); // Compatibility snapshots; the view uses taskModel.
 }
 std::shared_ptr<DownloadService::Task>
 DownloadService::find(const QString &id) const {
@@ -117,7 +170,9 @@ DownloadService::find(const QString &id) const {
       return t;
   return {};
 }
-void DownloadService::persist() {
+void DownloadService::persist(const std::shared_ptr<Task> &task) {
+  if (task)
+    notifyTask(task);
   db_.setSetting(
       "downloads.v1",
       QString::fromUtf8(QJsonDocument(QJsonArray::fromVariantList(tasks()))
@@ -182,7 +237,12 @@ void DownloadService::add(const QVariantList &tracks, const QString &quality) {
                {"created", QDateTime::currentMSecsSinceEpoch()},
                {"received", 0},
                {"total", 0}};
+    beginInsertRows({}, 0, 0);
+    for (const auto &existing : jobs_)
+      ++existing->row;
+    t->row = 0;
     jobs_.prepend(t);
+    endInsertRows();
   }
   persist();
   pump();
@@ -202,6 +262,7 @@ void DownloadService::pump() {
       continue;
     t->data["state"] = "resolving";
     t->data["error"] = "";
+    notifyTask(t);
     t->tried.insert(source_.activeId());
     ++count;
     t->resolution = source_.resolveMusicUrl(
@@ -217,8 +278,10 @@ void DownloadService::pump() {
   }
   if (count)
     update_.start();
-  else
+  else {
+    flushProgress();
     update_.stop();
+  }
   persist();
 }
 void DownloadService::resolutionFailed(const std::shared_ptr<Task> &t,
@@ -294,7 +357,7 @@ void DownloadService::resolutionFailed(const std::shared_ptr<Task> &t,
     if (t->attempt == attempt && t->alternative)
       resolutionFailed(t, "备用音源请求超时");
   });
-  persist();
+  persist(t);
 }
 void DownloadService::start(const std::shared_ptr<Task> &t,
                             const QVariantMap &resolved) {
@@ -343,7 +406,7 @@ void DownloadService::start(const std::shared_ptr<Task> &t,
       t->data["state"] = "completed";
       t->data["path"] = path;
       t->data["error"] = "文件已存在，已跳过";
-      persist();
+      persist(t);
       pump();
       return;
     }
@@ -424,7 +487,7 @@ void DownloadService::start(const std::shared_ptr<Task> &t,
     t->data["total"] = size;
     finalize(t);
   });
-  persist();
+  persist(t);
 }
 void DownloadService::drain(const std::shared_ptr<Task> &t) {
   if (!t->reply)
@@ -474,6 +537,10 @@ void DownloadService::drain(const std::shared_ptr<Task> &t) {
     return;
   }
   t->data["received"] = t->file.size();
+  if (!t->progressPending) {
+    t->progressPending = true;
+    progressUpdates_.append(t);
+  }
 }
 void DownloadService::detach(const std::shared_ptr<Task> &t) {
   ++t->attempt;
@@ -502,7 +569,7 @@ void DownloadService::fail(const std::shared_ptr<Task> &t,
   detach(t);
   t->data["state"] = "error";
   t->data["error"] = reason;
-  persist();
+  persist(t);
   QTimer::singleShot(0, this, [this] { pump(); });
 }
 void DownloadService::pause(const QString &id) {
@@ -512,7 +579,7 @@ void DownloadService::pause(const QString &id) {
     return;
   detach(t);
   t->data["state"] = "paused";
-  persist();
+  persist(t);
   pump();
 }
 void DownloadService::resume(const QString &id) {
@@ -523,7 +590,7 @@ void DownloadService::resume(const QString &id) {
     return;
   t->tried.clear();
   t->data["state"] = "queued";
-  persist();
+  persist(t);
   pump();
 }
 void DownloadService::cancel(const QString &id) {
@@ -537,7 +604,7 @@ void DownloadService::cancel(const QString &id) {
     QFile::remove(partial);
   t->data["state"] = "cancelled";
   t->data["received"] = 0;
-  persist();
+  persist(t);
   pump();
 }
 void DownloadService::pauseAll() {
@@ -546,13 +613,21 @@ void DownloadService::pauseAll() {
         t->data.value("state") == "queued") {
       detach(t);
       t->data["state"] = "paused";
+      notifyTask(t);
     }
   update_.stop();
+  progressUpdates_.clear();
   persist();
 }
 void DownloadService::clearRecords() {
   pauseAll();
-  jobs_.clear();
+  if (!jobs_.isEmpty()) {
+    beginRemoveRows({}, 0, int(jobs_.size()) - 1);
+    for (const auto &t : jobs_)
+      t->row = -1;
+    jobs_.clear();
+    endRemoveRows();
+  }
   persist();
 }
 void DownloadService::locate(const QString &id) {
@@ -571,7 +646,13 @@ void DownloadService::deleteFile(const QString &id) {
     emit notice("无法移到回收站");
     return;
   }
-  jobs_.removeAll(t);
+  const int row = t->row;
+  beginRemoveRows({}, row, row);
+  t->row = -1;
+  jobs_.removeAt(row);
+  for (int i = row; i < jobs_.size(); ++i)
+    jobs_.at(i)->row = i;
+  endRemoveRows();
   persist();
 }
 void DownloadService::chooseFolder() {
@@ -603,7 +684,7 @@ void DownloadService::fetchMetadata(const QUrl &url, int limit,
 }
 void DownloadService::finalize(const std::shared_ptr<Task> &t) {
   t->data["state"] = "finalizing";
-  persist();
+  persist(t);
   QVariantMap options;
   for (const auto &key : {"Artwork", "Lyrics", "Artist", "Album"})
     options[key] = settings_.value("download.embedContent." + QString(key),
@@ -629,7 +710,7 @@ void DownloadService::finalize(const std::shared_ptr<Task> &t) {
               emit fileCompleted(t->data.value("path").toString());
               writers_.removeAll(watcher);
               watcher->deleteLater();
-              persist();
+              persist(t);
               pump();
             });
     watcher->setFuture(QtConcurrent::run([options, track, path, raw, cover] {

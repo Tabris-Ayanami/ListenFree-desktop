@@ -5,14 +5,14 @@ import QtQuick.Effects
 Window {
     id: window
     flags: Qt.Window | Qt.FramelessWindowHint
-    width: 1066
+    width: 1040
     height: 709
-    minimumWidth: 1066
+    minimumWidth: 1040
     minimumHeight: 709
     visible: true
     color: "transparent"
     title: "ListenFree"
-    readonly property real cornerRadius: visibility === Window.Maximized || visibility === Window.FullScreen ? 0 : 8
+    readonly property real cornerRadius: visibility === Window.Maximized || visibility === Window.FullScreen ? 0 : AppTheme.normalWindowCornerRadius
     Rectangle {
         id: windowMask
         anchors.fill: parent

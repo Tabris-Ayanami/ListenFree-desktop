@@ -28,18 +28,39 @@ Item {
     property bool playing: false
     property real renderPositionMs: 0
     property real lastPositionUpdate: 0
+    property bool pendingSeekSync: false
     onPositionMsChanged: {
         const now = Date.now()
-        if (lastPositionUpdate > 0 && Math.abs(positionMs-renderPositionMs) > Math.max(650, now-lastPositionUpdate+350))
+        const discontinuity = lastPositionUpdate > 0
+            && Math.abs(positionMs-renderPositionMs) > Math.max(650, now-lastPositionUpdate+350)
+        if (discontinuity)
             notifySeek()
         else seeking = false
+        // Ordinary decoder updates can arrive behind the displayed frame.
+        // Correct their phase in the frame loop instead of rewinding each word.
+        if (pendingSeekSync || !playing || !animationActive || reducedMotion || lastPositionUpdate === 0)
+            renderPositionMs = positionMs
+        pendingSeekSync = false
         lastPositionUpdate = now
-        renderPositionMs = positionMs
     }
-    onPlayingChanged: renderPositionMs = positionMs
+    function resetPlayhead() {
+        renderPositionMs = positionMs
+        lastPositionUpdate = Date.now()
+    }
+    function advancePlayhead(deltaMs) {
+        const expected = positionMs + Math.max(0, Math.min(250, Date.now()-lastPositionUpdate))
+        const correction = Math.max(-deltaMs*.2, Math.min(deltaMs*.2, expected-renderPositionMs-deltaMs))
+        // Bound extrapolation if playback stalls, without introducing a reverse
+        // step when the most recent decoder sample is late.
+        renderPositionMs = Math.max(renderPositionMs,
+            Math.min(positionMs+250, renderPositionMs+deltaMs+correction))
+    }
+    onPlayingChanged: resetPlayhead()
+    onAnimationActiveChanged: resetPlayhead()
+    onReducedMotionChanged: resetPlayhead()
     FrameAnimation {
-        running: panel.playing && panel.animationActive && !panel.reducedMotion
-        onTriggered: panel.renderPositionMs = Math.min(panel.positionMs + 250, panel.renderPositionMs + frameTime * 1000)
+        running: panel.playing && panel.animationActive && !panel.reducedMotion && panel.wordTimingEnabled && panel.lineCount > 0
+        onTriggered: panel.advancePlayhead(frameTime * 1000)
     }
     property bool wordTimingEnabled: true
     property bool karaokeEnabled: true
@@ -88,6 +109,8 @@ Item {
     }
     function notifySeek() {
         seeking = true
+        pendingSeekSync = true
+        resetPlayhead()
         browsing = false
         touchBrowsing = false
         returnToFocus.stop()
@@ -111,8 +134,11 @@ Item {
         scheduleLayout("playback")
     }
     function scheduleLayout(reason) {
-        // A geometry notification in the same event turn must not cancel seek.
-        if (pendingLayoutReason !== "seek") pendingLayoutReason = reason
+        // Layout notifications can follow a line change in the same event
+        // turn. Keep that playback/seek intent when coalescing the pass.
+        if (pendingLayoutReason !== "seek"
+                && (reason !== "geometry" || pendingLayoutReason !== "playback"))
+            pendingLayoutReason = reason
         Qt.callLater(flushLayout)
     }
     function flushLayout() {
@@ -320,6 +346,10 @@ Item {
             readonly property real targetY: y - lyricList.contentY
             readonly property real renderedY: rowSpring.value
             readonly property bool nearViewport: targetY > -height && targetY < lyricList.height + height
+            // Inactive cached rows have no moving word effects. Avoid evaluating
+            // every token and grapheme on every frame of the global playhead.
+            readonly property real animationPositionMs: focusAmount > 0 && nearViewport && panel.animationActive
+                ? panel.renderPositionMs : 0
             property bool ready: false
             property int targetBatch: -1
             function commitTarget() {
@@ -335,7 +365,10 @@ Item {
                 } else if (!stagger.running) commitTarget()
             }
             onTargetYChanged: retarget()
-            onHeightChanged: panel.scheduleLayout("geometry")
+            // Scrolling creates cached delegates while forceLayout/contentY is
+            // being updated. Their initial height must not enqueue a second
+            // geometry pass that cancels every row's playback stagger.
+            onHeightChanged: if (ready && !panel.applyingLayout) panel.scheduleLayout("geometry")
             Component.onCompleted: { commitTarget(); ready = true }
             Connections {
                 target: panel
@@ -360,15 +393,28 @@ Item {
             radius: 16
             clip: false
             color: rowHover.hovered ? "#12ffffff" : "transparent"
-            opacity: timed && panel.karaokeEnabled ? (current ? .85 : 1) : (current ? 1 : .2)
-            Behavior on opacity { NumberAnimation { duration: panel.reducedMotion || !panel.animationActive ? 0 : 400 } }
+            property real focusOpacity: timed && panel.karaokeEnabled ? (current ? .85 : 1) : (current ? 1 : .2)
+            Behavior on focusOpacity { NumberAnimation { duration: panel.reducedMotion || !panel.animationActive ? 0 : 400 } }
+            // Fade whole lines before the viewport clips their glyphs. This is
+            // ordinary scene-graph opacity, with no full-panel mask texture.
+            readonly property real edgeOpacity: Math.max(0, Math.min(1,
+                (Math.min(renderedY+height*.5, lyricList.height-renderedY-height*.5)+height*.2)
+                    / Math.max(1,panel.fontSize*2.5)))
+            opacity: focusOpacity * edgeOpacity
             property real blurAmount: !panel.inactiveBlurEnabled || current || panel.touchBrowsing ? 0
                 : Math.min(5, (Math.abs(index-panel.focusLineIndex)+(index<panel.focusLineIndex?2:1))
                            * (panel.width <= 1024 ? .8 : 1)) / 8
-            Behavior on blurAmount { NumberAnimation { duration: panel.reducedMotion || !panel.animationActive ? 0 : 400 } }
+            Behavior on blurAmount {
+                NumberAnimation {
+                    // Resolve the incoming line before a short first syllable
+                    // finishes; outgoing lines can recede more gradually.
+                    duration: panel.reducedMotion || !panel.animationActive ? 0 : (lyricRow.current ? 180 : 400)
+                    easing.type: lyricRow.current ? Easing.OutCubic : Easing.Linear
+                }
+            }
             // Retain lyric/layout state while immersed, but release the hidden
             // row's offscreen blur textures. They return before it is painted.
-            layer.enabled: panel.visible && panel.inactiveBlurEnabled && nearViewport
+            layer.enabled: panel.visible && panel.animationActive && panel.inactiveBlurEnabled && nearViewport && blurAmount > .001
             layer.effect: MultiEffect {
                 blurEnabled: true
                 blur: lyricRow.blurAmount
@@ -411,44 +457,109 @@ Item {
                     TextMetrics { id: lineMetrics; font: primaryLine.font; text: primaryLine.text }
                     Flow {
                         id: wordFlow
+                        objectName: "lyricWordFlow" + lyricRow.index
                         visible: lyricRow.timed
                         readonly property var tokens: visible ? wordMetrics.prepare(lyricRow.modelData.words, primaryLine.font) : []
                         width: Math.min(primaryBlock.width,Math.ceil(lineMetrics.advanceWidth)+1)
                         x: panel.normalizedAlignment()==="left"?0:panel.normalizedAlignment()==="right"?primaryBlock.width-width:(primaryBlock.width-width)/2
                         spacing: 0
+                        // Flow wraps tokens but always starts each visual line
+                        // at x=0. Align each wrapped line without changing its
+                        // layout advances or feeding transforms back into Flow.
+                        function alignWrappedLines() {
+                            const lines = {}
+                            for (let i=0;i<children.length;++i) {
+                                const word = children[i]
+                                if (word.lineOffsetX === undefined) continue
+                                const key = String(word.y)
+                                if (!lines[key]) lines[key] = {end:0, words:[]}
+                                lines[key].end = Math.max(lines[key].end, word.x+word.width)
+                                lines[key].words.push(word)
+                            }
+                            const alignment = panel.normalizedAlignment()
+                            for (const key in lines) {
+                                const line = lines[key]
+                                const free = Math.max(0,width-line.end)
+                                const offset = alignment === "left" ? 0 : alignment === "right" ? free : free*.5
+                                for (let i=0;i<line.words.length;++i) line.words[i].lineOffsetX = offset
+                            }
+                        }
+                        onPositioningComplete: alignWrappedLines()
+                        Connections {
+                            target: panel
+                            function onAlignmentModeChanged() { wordFlow.alignWrappedLines() }
+                        }
                         Repeater {
                             model: wordFlow.tokens
                             delegate: Item {
                                 id: wordItem
                                 required property var modelData
                                 required property int index
-                                readonly property real progress: Math.max(0,Math.min(1,(panel.renderPositionMs-modelData.startMs)/Math.max(1,modelData.endMs-modelData.startMs)))
+                                property real lineOffsetX: 0
+                                transform: Translate { x: wordItem.lineOffsetX }
+                                // Read the QVariant-backed timing/shape maps when
+                                // their data changes, not in every animation sample.
+                                readonly property real startTimeMs: Number(modelData.startMs)
+                                readonly property real endTimeMs: Number(modelData.endMs)
+                                readonly property real progress: Math.max(0,Math.min(1,(lyricRow.animationPositionMs-startTimeMs)/wordDuration))
+                                // AMLL's base word float rises once and holds;
+                                // only scale/glow use the short accent release.
+                                // A settled progress stays constant, so completed
+                                // words do not keep sampling the lift curve.
                                 readonly property real floatProgress: Math.max(0, Math.min(1,
-                                    (panel.renderPositionMs-modelData.startMs) / Math.max(1000, modelData.endMs-modelData.startMs)))
-                                readonly property real wordDuration: Math.max(1, modelData.endMs-modelData.startMs)
+                                    (lyricRow.animationPositionMs-startTimeMs) / Math.max(1000, wordDuration)))
+                                readonly property real wordDuration: Math.max(1, endTimeMs-startTimeMs)
+                                readonly property bool hasInk: Number(modelData.charCount) > 0
                                 readonly property bool emphasized: Boolean(modelData.emphasized)
                                 readonly property real emphasisAmount: Number(modelData.emphasisAmount)
                                 readonly property real emphasisDuration: Number(modelData.emphasisDuration)
                                 readonly property real emphasisStart: Number(modelData.emphasisStart)
+                                readonly property real emphasisGlow: Number(modelData.emphasisGlow)
+                                readonly property real groupCount: Math.max(1,Number(modelData.groupCount))
+                                readonly property real accentEnvelope: accentActive ? panel.sampleCurve(panel.liftCurve,
+                                    (lyricRow.animationPositionMs-startTimeMs)/Math.min(250, Math.max(80, wordDuration)))
+                                    * (1-panel.sampleCurve(panel.emphasisFall, (lyricRow.animationPositionMs-endTimeMs)/320)) : 0
+                                readonly property bool accentActive: hasInk && !emphasized && lyricRow.animationPositionMs >= startTimeMs
+                                    && lyricRow.animationPositionMs < endTimeMs+320
+                                // Allocate only for the actual emphasis envelope.
+                                // The base float owns vertical motion; a second,
+                                // early sine lift makes unsung glyphs rise too soon.
+                                readonly property real emphasisEnd: emphasisStart
+                                    + emphasisDuration/2.5/groupCount
+                                        * Math.max(0,Number(modelData.charOffset)+Number(modelData.charCount)-1)
+                                    + emphasisDuration
+                                readonly property bool emphasisActive: emphasized && lyricRow.animationPositionMs >= emphasisStart
+                                    && lyricRow.animationPositionMs < emphasisEnd
                                 readonly property real sungAlpha: .2 + .8 * lyricRow.focusAmount
                                 readonly property real unsungAlpha: .2 + .2 * lyricRow.focusAmount
                                 readonly property real lift: !panel.reducedMotion && panel.animationActive
-                                    ? -panel.fontSize * .05 * panel.sampleCurve(panel.liftCurve, floatProgress) * lyricRow.focusAmount : 0
-                                width: Math.min(wordFlow.width,wordGlyph.implicitWidth)
-                                height: wordGlyph.implicitHeight
+                                    ? -panel.fontSize * .05 * panel.sampleCurve(panel.liftCurve, floatProgress)
+                                      * lyricRow.focusAmount : 0
+                                width: Math.min(wordFlow.width,Number(modelData.leadingSpace)+wordGlyph.implicitWidth+Number(modelData.trailingSpace))
+                                height: Math.max(wordGlyph.implicitHeight,panel.fontSize)
                                 // Reserve the original advance. Animated glyphs never relayout the Flow.
                                 Text {
                                     id: wordGlyph
                                     objectName: "lyricWord" + lyricRow.index + "/" + wordItem.index
-                                    text: String(wordItem.modelData.text); textFormat: Text.PlainText
+                                    text: String(wordItem.modelData.displayText); textFormat: Text.PlainText
                                     color: panel.foreground; font: primaryLine.font
+                                    // Loader teardown releases ShaderEffectSource's
+                                    // hideSource reference a frame later. Own the
+                                    // native/effect switch here so no frame loses ink.
+                                    // Qt still captures an invisible sourceItem.
+                                    visible: !emphasisLoader.active
+                                    x: Number(wordItem.modelData.leadingSpace)
                                     y: wordItem.lift
-                                    opacity: layer.enabled || emphasisLoader.active ? 1 : (panel.karaokeEnabled ? wordItem.sungAlpha : 1)
-                                    layer.enabled: !emphasisLoader.active && lyricRow.focusAmount > 0 && panel.karaokeEnabled && panel.animationActive
+                                    opacity: layer.enabled || emphasisLoader.active ? 1 : (panel.karaokeEnabled
+                                        ? (wordItem.progress <= 0 ? wordItem.unsungAlpha : wordItem.sungAlpha) : 1)
+                                    // Only a partially sung token needs a mask texture.
+                                    // Before/after its interval, native text has the same pixels.
+                                    layer.enabled: wordItem.hasInk && !emphasisLoader.active && lyricRow.focusAmount > 0 && lyricRow.nearViewport
+                                        && panel.karaokeEnabled && panel.animationActive && wordItem.progress > 0 && wordItem.progress < 1
                                     layer.effect: ShaderEffect {
                                         property var source
                                         property real progress: wordItem.progress
-                                        property real edgeWidth: panel.fontSize*.25/Math.max(1,wordItem.width)
+                                        property real edgeWidth: panel.fontSize*.25/Math.max(1,wordGlyph.implicitWidth)
                                         property real sungAlpha: wordItem.sungAlpha
                                         property real unsungAlpha: wordItem.unsungAlpha
                                         fragmentShader: "qrc:/shaders/lyric-word.frag.qsb"
@@ -456,16 +567,19 @@ Item {
                                 }
                                 Loader {
                                     id: emphasisLoader
-                                    anchors.fill: parent
-                                    active: wordItem.emphasized && lyricRow.focusAmount > 0 && lyricRow.nearViewport
+                                    x: wordGlyph.x
+                                    width: wordGlyph.implicitWidth; height: wordGlyph.implicitHeight
+                                    active: (wordItem.emphasisActive || wordItem.accentActive) && lyricRow.focusAmount > 0 && lyricRow.nearViewport
                                             && panel.animationActive && !panel.reducedMotion
                                     sourceComponent: Item {
                                         id: emphasisBody
                                         // One static shaped texture for the token, shared by all glyph quads.
                                         ShaderEffectSource {
                                             id: shapedWord
+                                            objectName: (wordItem.emphasized ? "lyricEmphasisTexture" : "lyricAccentTexture")
+                                                + lyricRow.index + "/" + wordItem.index
                                             sourceItem: wordGlyph
-                                            hideSource: true
+                                            hideSource: false
                                             live: false
                                             visible: false
                                             sourceRect: Qt.rect(0, 0, wordGlyph.implicitWidth, wordGlyph.implicitHeight)
@@ -478,39 +592,51 @@ Item {
                                             }
                                         }
                                         Repeater {
-                                            model: wordItem.modelData.glyphs
+                                            // Short tokens need one quad, regardless of their character count.
+                                            // Split glyphs only for the staggered, sustained-note animation.
+                                            model: wordItem.emphasized ? wordItem.modelData.glyphs
+                                                : [{left: 0, right: wordGlyph.implicitWidth, ordinal: 0}]
                                             delegate: ShaderEffect {
                                                 id: glyphSlice
                                                 required property var modelData
                                                 required property int index
-                                                objectName: "lyricGrapheme" + lyricRow.index + "/" + wordItem.index + "/" + index
+                                                objectName: (wordItem.emphasized ? "lyricGrapheme" : "lyricAccent")
+                                                    + lyricRow.index + "/" + wordItem.index + "/" + index
+                                                readonly property real glyphOrdinal: Number(modelData.ordinal)
                                                 readonly property real ordinal: Number(wordItem.modelData.charOffset) + Math.max(0, Number(modelData.ordinal))
                                                 readonly property real start: wordItem.emphasisStart + wordItem.emphasisDuration / 2.5
-                                                    / Math.max(1, Number(wordItem.modelData.groupCount)) * ordinal
-                                                readonly property real time: (panel.renderPositionMs-start) / wordItem.emphasisDuration
-                                                readonly property real envelope: modelData.ordinal < 0 ? 0 : (time < .5
+                                                    / wordItem.groupCount * ordinal
+                                                readonly property real time: (lyricRow.animationPositionMs-start) / wordItem.emphasisDuration
+                                                readonly property real envelope: !wordItem.emphasized ? wordItem.accentEnvelope * lyricRow.focusAmount
+                                                    : glyphOrdinal < 0 ? 0 : (time < .5
                                                     ? panel.sampleCurve(panel.emphasisRise, time*2) : 1-panel.sampleCurve(panel.emphasisFall, time*2-1)) * lyricRow.focusAmount
-                                                readonly property real extraLift: modelData.ordinal < 0 ? 0 : Math.sin(Math.PI * Math.max(0, Math.min(1,
-                                                    (panel.renderPositionMs-start+400) / (wordItem.emphasisDuration*1.4)))) * lyricRow.focusAmount
-                                                readonly property real padding: Math.ceil(panel.fontSize * .32)
+                                                // Keep split-glyph geometry stable at its hard
+                                                // internal clip edges. Whole-token accents can
+                                                // fit the kernel, with one raster pixel of slack.
+                                                readonly property real padding: wordItem.emphasized ? Math.ceil(panel.fontSize*.36)
+                                                    : Math.ceil(Math.max(.5, glowRadius)*Math.SQRT2) + 1
                                                 readonly property real glyphLeft: Number(modelData.left)
                                                 readonly property real glyphRight: Number(modelData.right)
                                                 width: Math.max(1, glyphRight-glyphLeft) + padding*2
                                                 height: wordGlyph.implicitHeight + padding*2
-                                                x: glyphLeft-padding - panel.fontSize*.03*wordItem.emphasisAmount*envelope
-                                                   * (Number(wordItem.modelData.groupCount)/2-ordinal)
-                                                y: -padding + wordItem.lift - panel.fontSize*(.025*wordItem.emphasisAmount*envelope + .05*extraLift)
-                                                scale: 1 + .1*wordItem.emphasisAmount*envelope
-                                                transformOrigin: Item.Bottom
+                                                x: glyphLeft-padding - (wordItem.emphasized ? panel.fontSize*.03*wordItem.emphasisAmount*envelope
+                                                   * (wordItem.groupCount/2-ordinal) : 0)
+                                                y: -padding + wordItem.lift - (wordItem.emphasized ? panel.fontSize*.025*wordItem.emphasisAmount*envelope : 0)
+                                                scale: 1 + (wordItem.emphasized ? .1*wordItem.emphasisAmount : .015)*envelope
+                                                // Symmetric padding must not change the
+                                                // visible glyph's expansion or add lift.
+                                                transformOrigin: Item.Center
                                                 property var source: shapedWord
                                                 property vector4d sourceRect: Qt.vector4d(glyphLeft-padding, -padding, width, height)
                                                 property vector4d clipRect: Qt.vector4d(glyphLeft, 0, glyphRight, wordGlyph.implicitHeight)
                                                 property vector2d sourceSize: Qt.vector2d(Math.max(1,wordGlyph.implicitWidth), Math.max(1,wordGlyph.implicitHeight))
                                                 property color glowColor: panel.foreground
-                                                property real glowRadius: Math.min(.3, Number(wordItem.modelData.emphasisGlow)*.3)*panel.fontSize
-                                                property real glowAlpha: Number(wordItem.modelData.emphasisGlow)*envelope
+                                                // A weaker note reduces halo energy without
+                                                // collapsing its soft falloff to a hard edge.
+                                                property real glowRadius: (wordItem.emphasized ? Math.max(.16, Math.min(.3, wordItem.emphasisGlow*.3)) : .09)*panel.fontSize
+                                                property real glowAlpha: (wordItem.emphasized ? wordItem.emphasisGlow : .16)*envelope
                                                 property real progress: wordItem.progress
-                                                property real edgeWidth: panel.fontSize*.25/Math.max(1,wordItem.width)
+                                                property real edgeWidth: panel.fontSize*.25/Math.max(1,wordGlyph.implicitWidth)
                                                 property real sungAlpha: panel.karaokeEnabled ? wordItem.sungAlpha : 1
                                                 property real unsungAlpha: panel.karaokeEnabled ? wordItem.unsungAlpha : 1
                                                 fragmentShader: "qrc:/shaders/lyric-grapheme.frag.qsb"

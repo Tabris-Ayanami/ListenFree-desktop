@@ -33,7 +33,13 @@ QtObject {
         return Math.min(2400, Math.ceil((sizes[tier] || sizes.Medium) * Math.max(1, dpr)))
     }
     property var currentPopup: null
-    property real windowCornerRadius: 8
+    readonly property real expandedPlayerCornerRadius: 18
+    readonly property real playerEdgeMargin: 14
+    // Equal side/bottom insets keep the window and expanded island concentric.
+    readonly property real normalWindowCornerRadius: expandedPlayerCornerRadius + playerEdgeMargin
+    property real windowCornerRadius: normalWindowCornerRadius
+    readonly property real toolbarHeight: 58
+    readonly property real toolbarControlHeight: 32
     readonly property var playbackModes: [
         {mode: "listLoop", kind: "repeat", label: qsTr("列表循环")},
         {mode: "singleLoop", kind: "repeatOne", label: qsTr("单曲循环")},

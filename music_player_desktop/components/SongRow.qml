@@ -44,7 +44,7 @@ Rectangle {
             return backendRadioController.isFavorite(track)
         }
         if (!favorites) return false
-        const revision = favorites.playlists
+        const revision = favorites.likedTracksRevision
         return favorites.isTrackLiked(track)
     }
     readonly property bool local: String(track.localPath || "").length > 0 || String(track.source || "").toLowerCase() === "local"

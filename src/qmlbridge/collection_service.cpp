@@ -4,6 +4,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QDir>
+#include <QCryptographicHash>
 #include <QRegularExpression>
 #include <QTextDocumentFragment>
 #include <QUrlQuery>
@@ -11,6 +12,8 @@
 
 namespace listenfree::qmlbridge {
 namespace {
+constexpr int playlistPageSize = 100;
+constexpr int playlistTrackLimit = 5000;
 QString referenceKey(const QVariantMap& row) {
   return row.value("source","kw").toString()+":"+(row.value("kind")=="album" ? "album:" : "")+row.value("playlistId",row.value("id")).toString();
 }
@@ -56,8 +59,8 @@ QVariantList safeTracks(const QVariantList &rows) {
 }
 } // namespace
 CollectionService::CollectionService(infrastructure::database::Database &db,
-                                     QObject *parent)
-    : QObject(parent), db_(db) {
+                                     QObject *parent, QNetworkAccessManager *network)
+    : QObject(parent), db_(db), network_(network ? network : &ownedNetwork_) {
   get(QUrl("https://music.163.com/api/search/hot?type=1111"),[this](QJsonObject result,QString){
     for(const auto& v:result.value("result").toObject().value("hots").toArray()) { const auto term=v.toObject().value("first").toString();if(!term.isEmpty())hotSearches_.append(term); }
     emit discoverChanged();
@@ -67,6 +70,7 @@ CollectionService::CollectionService(infrastructure::database::Database &db,
                    db_.getSetting("collections.v1").value_or("[]")))
                .array()
                .toVariantList();
+  refreshLikedTrackIndex();
   const auto home = QJsonDocument::fromJson(QByteArray::fromStdString(db_.getSetting("discovery.home.v1").value_or("{}"))).object();
   homeRecommendations_=home.value("recommendations").toArray().toVariantList().mid(0,12);
   homeCharts_=home.value("charts").toArray().toVariantList();
@@ -162,6 +166,7 @@ bool CollectionService::save(const QVariantList &lists) {
     return false;
   }
   lists_ = lists;
+  refreshLikedTrackIndex();
   emit playlistsChanged();
   return true;
 }
@@ -202,12 +207,25 @@ void CollectionService::remove(const QString &id) {
 void CollectionService::clear() { save({}); }
 bool CollectionService::isTrackLiked(const QVariantMap &track) const {
   const auto key = likedTrackKey(track);
-  if (key.isEmpty()) return false;
+  return !key.isEmpty() && likedTrackKeys_.contains(key);
+}
+void CollectionService::refreshLikedTrackIndex() {
+  QSet<QString> keys;
   const auto i = index("liked-tracks");
-  if (i < 0) return false;
-  for (const auto &v : lists_[i].toMap().value("tracks").toList())
-    if (likedTrackKey(v.toMap()) == key) return true;
-  return false;
+  if (i >= 0) {
+    const auto rows = lists_[i].toMap().value("tracks").toList();
+    keys.reserve(rows.size());
+    for (const auto& value : rows) {
+      auto key = likedTrackKey(value.toMap());
+      if (!key.isEmpty()) keys.insert(std::move(key));
+    }
+  }
+  // Metadata, ordering and unrelated playlists do not change membership.
+  // Publish only after successful persistence, before notifying consumers.
+  if (keys == likedTrackKeys_) return;
+  likedTrackKeys_.swap(keys);
+  ++likedTracksRevision_;
+  emit likedTracksChanged();
 }
 void CollectionService::toggleTrackLiked(const QVariantMap &track) {
   const auto cleanRows = safeTracks({track});
@@ -310,7 +328,7 @@ CollectionService::get(const QUrl &url,
   request.setTransferTimeout(15000);
   request.setRawHeader("User-Agent", "Mozilla/5.0");
   if(url.host()=="music.163.com")request.setRawHeader("Referer","https://music.163.com/");
-  auto *reply = network_.get(request);
+  auto *reply = network_->get(request);
   reply->setReadBufferSize(4 * 1024 * 1024 + 1);
   connect(reply, &QNetworkReply::readyRead, this, [reply] {
     if (reply->bytesAvailable() > 4 * 1024 * 1024)
@@ -334,7 +352,7 @@ void CollectionService::refresh(const QString &order) {
   const auto gen = ++discoveryGeneration_;
   if(platform_!="kw") {
     recommendations_.clear();charts_.clear();tags_.clear();tagIds_.clear();error_.clear();requests_=1;emit discoverChanged();
-    const auto provider=platform_;auto* reply=online::platformRequest(network_,provider,"lists",activeTag_,order_);
+    const auto provider=platform_;auto* reply=online::platformRequest(*network_,provider,"lists",activeTag_,order_);
     if(!reply){requests_=0;emit discoverChanged();return;}
     connect(reply,&QNetworkReply::finished,this,[this,reply,provider,gen]{
       reply->deleteLater();
@@ -475,6 +493,9 @@ void CollectionService::filter(const QString &key, const QString &value) {
 }
 void CollectionService::cancelDetail() {
   ++detailGeneration_;
+  detailTrackIds_.clear();
+  detailTracksById_.clear();
+  detailPageDigests_.clear();
   if (bilibili_) bilibili_->cancel(bilibiliDetailId_);
   bilibiliDetailId_.clear();
   detailBusy_ = false;
@@ -488,7 +509,9 @@ void CollectionService::open(const QVariantMap &collection) {
   cancelDetail();
   detail_ = collection;
   if(collection.contains("playlistId")) detail_["id"]=collection.value("playlistId");
-  detail_["tracks"] = collection.value("tracks", QVariantList{});
+  // Remote cards may contain a preview or an old saved snapshot, not a page.
+  detail_["tracks"] = collection.value("kind") == "Local"
+                          ? collection.value("tracks", QVariantList{}) : QVariantList{};
   detail_["error"] = "";
   detailBusy_ = collection.value("kind").toString() != "Local";
   emit detailChanged();
@@ -507,8 +530,9 @@ void CollectionService::open(const QVariantMap &collection) {
     }
     else if(collection.value("kind")=="album")albumPage(1,detailGeneration_);
     else if(provider=="kw")page(0,detailGeneration_);
+    else if(provider=="wy" || provider=="kg")remotePlaylist(detailGeneration_);
     else {
-      const auto gen=detailGeneration_;auto* reply=online::platformRequest(network_,provider,"detail",detail_.value("id").toString());
+      const auto gen=detailGeneration_;auto* reply=online::platformRequest(*network_,provider,"detail",detail_.value("id").toString());
       if(!reply){detailBusy_=false;detail_["error"]="此平台歌单暂不可用";emit detailChanged();return;}
       detailReply_=reply;connect(reply,&QNetworkReply::finished,this,[this,reply,provider,gen]{reply->deleteLater();if(gen!=detailGeneration_)return;detailReply_=nullptr;detailBusy_=false;
         if(reply->error()==QNetworkReply::NoError){const auto parsed=online::platformDetail(provider,online::platformJson(reply->readAll()));for(auto i=parsed.cbegin();i!=parsed.cend();++i)if(i.value().isValid()&&i.value()!=QString(""))detail_[i.key()]=i.value();}
@@ -516,9 +540,167 @@ void CollectionService::open(const QVariantMap &collection) {
     }
   }
 }
+void CollectionService::releaseDetail() {
+  if (detail_.isEmpty() && !detailBusy_ && !detailReply_ && bilibiliDetailId_.isEmpty()) return;
+  // The page owns this temporary snapshot; saved lists and the queue have
+  // independent shared references. Invalidate requests before abort callbacks.
+  detail_.clear();
+  cancelDetail();
+}
+void CollectionService::finishRemoteDetail(const QString &error) {
+  detailBusy_ = false;
+  const auto count = detail_.value("tracks").toList().size();
+  const auto total = detail_.value("total").toInt();
+  if (!error.isEmpty())
+    detail_["error"] = QStringLiteral("%1（已加载 %2 首）").arg(error).arg(count);
+  else if (count >= playlistTrackLimit && total > count)
+    detail_["error"] = QStringLiteral("此歌单已加载前 5000 首歌曲");
+  else if (count < total)
+    detail_["error"] = QStringLiteral("已加载 %1 / %2 首，部分歌曲暂不可用").arg(count).arg(total);
+  detailTrackIds_.clear();
+  detailTracksById_.clear();
+  detailPageDigests_.clear();
+  emit detailChanged();
+}
+
+void CollectionService::remotePlaylist(quint64 gen) {
+  if (gen != detailGeneration_ || !detailBusy_) return;
+  const auto provider = detail_.value("source").toString();
+  auto *reply = online::platformRequest(*network_, provider, "detail", detail_.value("id").toString());
+  detailReply_ = reply;
+  connect(reply, &QNetworkReply::finished, this, [this, reply, provider, gen] {
+    reply->deleteLater();
+    if (gen != detailGeneration_) return;
+    detailReply_ = nullptr;
+    const auto object = online::platformJson(reply->readAll());
+    const auto playlist = object.value("playlist").toObject();
+    const bool valid = provider == "wy"
+        ? object.value("code").toInt() == 200 && !playlist.isEmpty()
+        : object.value("list").toObject().value("list").toObject().contains("total");
+    if (reply->error() != QNetworkReply::NoError || !valid) {
+      finishRemoteDetail(QStringLiteral("歌单获取失败，请重新打开重试"));
+      return;
+    }
+    const auto parsed = online::platformDetail(provider, object);
+    for (auto i = parsed.cbegin(); i != parsed.cend(); ++i)
+      if (i.key() != "tracks" && i.value().isValid() && i.value() != QString(""))
+        detail_[i.key()] = i.value();
+    if (provider == "kg") {
+      // The mobile web response is a ten-song preview, even with page parameters.
+      // Load the actual pages through the catalog API instead.
+      kugouPage(1, 0, gen);
+      return;
+    }
+    const auto ids = playlist.value("trackIds").toArray();
+    QSet<QString> seen;
+    for (const auto &value : ids) {
+      const auto id = value.toObject().value("id").toVariant().toString();
+      if (id.isEmpty() || seen.contains(id)) continue;
+      seen.insert(id);
+      if (detailTrackIds_.size() < playlistTrackLimit) detailTrackIds_.append(id);
+    }
+    detail_["total"] = qMax(detail_.value("total").toInt(), int(seen.size()));
+    const auto rows = parsed.value("tracks").toList().mid(0, playlistTrackLimit);
+    for (const auto &value : rows) {
+      const auto row = value.toMap();
+      detailTracksById_.insert(row.value("rid").toString(), row);
+    }
+    detail_["tracks"] = rows;
+    // Anonymous NetEase detail can contain only ten tracks; trackIds retains
+    // the playlist order and is the cursor, regardless of missing song details.
+    neteaseTracks(0, gen);
+  });
+}
+
+void CollectionService::neteaseTracks(int offset, quint64 gen) {
+  if (gen != detailGeneration_ || !detailBusy_) return;
+  QStringList batch;
+  while (offset < detailTrackIds_.size() && batch.isEmpty()) {
+    const auto end = qMin(offset + playlistPageSize, int(detailTrackIds_.size()));
+    for (; offset < end; ++offset) {
+      const auto &id = detailTrackIds_[offset];
+      if (!detailTracksById_.contains(id)) batch.append(id);
+    }
+  }
+  if (!detailTrackIds_.isEmpty()) {
+    QVariantList rows;
+    for (const auto &id : detailTrackIds_)
+      if (detailTracksById_.contains(id)) rows.append(detailTracksById_.value(id));
+    detail_["tracks"] = rows;
+  }
+  if (batch.isEmpty()) {
+    finishRemoteDetail();
+    return;
+  }
+  emit detailChanged();
+  if (gen != detailGeneration_ || !detailBusy_) return;
+  auto *reply = online::platformRequest(*network_, "wy", "songs", batch.join(','));
+  detailReply_ = reply;
+  connect(reply, &QNetworkReply::finished, this, [this, reply, batch, offset, gen] {
+    reply->deleteLater();
+    if (gen != detailGeneration_) return;
+    detailReply_ = nullptr;
+    const auto object = online::platformJson(reply->readAll());
+    if (reply->error() != QNetworkReply::NoError || object.value("code").toInt() != 200 || !object.value("songs").isArray()) {
+      finishRemoteDetail(QStringLiteral("歌曲详情加载中断，请重新打开重试"));
+      return;
+    }
+    for (const auto &value : online::platformSongs("wy", object)) {
+      const auto row = value.toMap();
+      const auto id = row.value("rid").toString();
+      if (batch.contains(id)) detailTracksById_.insert(id, row);
+    }
+    neteaseTracks(offset, gen);
+  });
+}
+
+void CollectionService::kugouPage(int number, int received, quint64 gen) {
+  if (gen != detailGeneration_ || !detailBusy_) return;
+  auto *reply = online::platformRequest(*network_, "kg", "playlistSongs", detail_.value("id").toString(),
+                                        "hot", number, playlistPageSize);
+  detailReply_ = reply;
+  connect(reply, &QNetworkReply::finished, this, [this, reply, number, received, gen] {
+    reply->deleteLater();
+    if (gen != detailGeneration_) return;
+    detailReply_ = nullptr;
+    const auto object = online::platformJson(reply->readAll());
+    const auto data = object.value("data").toObject();
+    if (reply->error() != QNetworkReply::NoError || object.value("status").toInt() != 1 || !data.value("info").isArray()) {
+      finishRemoteDetail(QStringLiteral("歌单分页加载中断，请重新打开重试"));
+      return;
+    }
+    const auto raw = data.value("info").toArray();
+    const auto digest = QCryptographicHash::hash(QJsonDocument(raw).toJson(QJsonDocument::Compact), QCryptographicHash::Sha256);
+    if (!raw.isEmpty() && detailPageDigests_.contains(digest)) {
+      finishRemoteDetail(QStringLiteral("平台重复返回同一页，请稍后重试"));
+      return;
+    }
+    detailPageDigests_.insert(digest);
+    if (data.contains("total")) detail_["total"] = data.value("total").toVariant().toInt();
+    auto rows = detail_.value("tracks").toList();
+    for (const auto &value : online::platformSongs("kg", object)) {
+      // Different album/file versions can share audio_id. Preserve the actual
+      // playlist entries and their hashes; repeated pages are checked above.
+      if (rows.size() >= playlistTrackLimit) break;
+      rows.append(value);
+    }
+    detail_["tracks"] = rows;
+    const int consumed = received + int(raw.size());
+    // Raw entries advance the page even when one entry has no usable identity.
+    const bool more = !raw.isEmpty() && consumed < detail_.value("total").toInt()
+                      && number * playlistPageSize < playlistTrackLimit;
+    if (!more) {
+      finishRemoteDetail();
+      return;
+    }
+    emit detailChanged();
+    kugouPage(number + 1, consumed, gen);
+  });
+}
+
 void CollectionService::albumPage(int number, quint64 gen) {
   const auto provider=detail_.value("source").toString();
-  auto* reply=online::platformRequest(network_,provider,"album",detail_.value("id").toString(),"hot",number,100);
+  auto* reply=online::platformRequest(*network_,provider,"album",detail_.value("id").toString(),"hot",number,100);
   if(!reply){detailBusy_=false;detail_["error"]="此平台专辑暂不可用";emit detailChanged();return;}
   detailReply_=reply;
   connect(reply,&QNetworkReply::finished,this,[this,reply,provider,number,gen] {
@@ -545,6 +727,7 @@ void CollectionService::albumPage(int number, quint64 gen) {
 }
 void CollectionService::reloadSaved() {
   lists_=QJsonDocument::fromJson(QByteArray::fromStdString(db_.getSetting("collections.v1").value_or("[]"))).array().toVariantList();
+  refreshLikedTrackIndex();
   const auto selected=index(detail_.value("id").toString());
   if(selected>=0){detail_=lists_[selected].toMap();emit detailChanged();}
   emit playlistsChanged();

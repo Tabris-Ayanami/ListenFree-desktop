@@ -15,6 +15,7 @@ Item {
         property int searches: 0
         function searchLyricMatches(track,query) { ++searches }
         function cancelLyricMatch() { lyricMatchBusy=false }
+        function releaseLyricMatch() { cancelLyricMatch();lyricCandidates=[];lyricMatchSources=[];lyricPreview="";lyricPreviewLines=[] }
         function previewLyricMatch(index) { lyricPreview=lyricCandidates[index].title;lyricPreviewLines=[{text:lyricPreview}] }
     }
     LyricsMatchPopup { id: popup;controller: backend }

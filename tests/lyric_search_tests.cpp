@@ -92,6 +92,52 @@ private slots:
         QTest::qWait(230);
         QCOMPARE(search.results().size(),1);QCOMPARE(search.results().first().toMap().value("rid").toString(),QString("2"));
     }
+    void releaseDropsSessionAndReusesBoundedSuccessCache() {
+        Network network;network.respond=[](const auto&) { return Response{lrcResult(),1}; };
+        LyricSearch search(network);
+        search.search(track,"Song Artist","lrclib");
+        QTRY_VERIFY_WITH_TIMEOUT(!search.busy(),300);
+        const auto accepted = search.lyrics(0);
+        QVERIFY(!accepted.isEmpty());
+        for(int i=0;i<10;++i) {
+            QSignalSpy changed(&search,&LyricSearch::changed);
+            search.release();
+            QCOMPARE(changed.size(),1);
+            QVERIFY(!search.busy());QVERIFY(search.results().isEmpty());QVERIFY(search.sources().isEmpty());
+            QVERIFY(search.lyrics(0).isEmpty());
+            search.release(); // Idempotent when already closed.
+            search.search(track,"Song Artist","lrclib");
+            QVERIFY(!search.busy());QCOMPARE(search.results().size(),1);QCOMPARE(search.lyrics(0),accepted);
+        }
+        QCOMPARE(network.urls.size(),1);
+    }
+    void stopRetainsResultsButReleaseInvalidatesPendingReplies() {
+        Network network;network.respond=[](const auto& request) { return request.url().host()=="lrclib.net" ? Response{lrcResult(),1} : Response{{},200}; };
+        LyricSearch search(network);
+        search.search(track,"Song Artist");
+        QTRY_COMPARE_WITH_TIMEOUT(search.results().size(),1,100);
+        QVERIFY(search.busy());
+        const auto accepted=search.lyrics(0);
+        search.cancel();
+        QVERIFY(!search.busy());QCOMPARE(search.results().size(),1);QCOMPARE(search.lyrics(0),accepted);
+        search.release();
+        QVERIFY(search.results().isEmpty());QVERIFY(search.sources().isEmpty());
+        QTest::qWait(250);
+        QVERIFY(search.results().isEmpty());QVERIFY(search.sources().isEmpty());QVERIFY(search.lyrics(0).isEmpty());
+        search.search(track,"Song Artist","lrclib");
+        QCOMPARE(search.results().size(),1);QCOMPARE(search.lyrics(0),accepted);
+    }
+    void releaseWhileBusyPublishesOnlyEmptySession() {
+        Network network;network.respond=[](const auto&) { return Response{lrcResult(),200}; };
+        LyricSearch search(network);
+        search.search(track,"Song Artist","lrclib");
+        QVERIFY(search.busy());
+        QSignalSpy changed(&search,&LyricSearch::changed);
+        search.release();
+        QCOMPARE(changed.size(),1);QVERIFY(!search.busy());QVERIFY(search.sources().isEmpty());
+        QTest::qWait(250);
+        QCOMPARE(changed.size(),1);QVERIFY(search.results().isEmpty());
+    }
     void emptyResponsesAreRetriedAndNotCached() {
         Network network;int requests=0;network.respond=[&](const auto&) { return Response{++requests<=2?QByteArray("[]"):lrcResult()}; };
         LyricSearch search(network);
@@ -107,6 +153,7 @@ private slots:
         LyricSearch search(network);
         search.search(track,"Song Artist","lrclib");QTRY_VERIFY_WITH_TIMEOUT(!search.busy(),1000);
         QCOMPARE(network.urls.size(),1);
+        search.release(); // Closing the dialog must not defeat provider backoff.
         search.search(track,"Song Artist","lrclib");QVERIFY(!search.busy());QCOMPARE(network.urls.size(),1);
         QVERIFY(search.sources().first().toMap().value("detail").toString().contains("限流"));
     }

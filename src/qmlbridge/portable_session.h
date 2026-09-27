@@ -112,6 +112,7 @@ public:
     Q_INVOKABLE void searchLyricMatches(const QVariantMap& track, const QString& query = {}, const QString& source = "all");
     Q_INVOKABLE void previewLyricMatch(int index);
     Q_INVOKABLE void cancelLyricMatch();
+    Q_INVOKABLE void releaseLyricMatch();
     Q_INVOKABLE bool applyLyricMatch(const QVariantMap& track, const QString& lyrics);
     bool equalizerEnabled() const { return equalizerEnabled_; }
     QVariantList equalizerGains() const { return equalizerGains_; }

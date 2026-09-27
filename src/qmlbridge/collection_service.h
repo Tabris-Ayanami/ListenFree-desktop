@@ -4,6 +4,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QPointer>
+#include <QSet>
 #include <QDateTime>
 #include <functional>
 
@@ -13,6 +14,7 @@ namespace listenfree::qmlbridge {
 class CollectionService final : public QObject {
   Q_OBJECT
   Q_PROPERTY(QVariantList playlists READ playlists NOTIFY playlistsChanged)
+  Q_PROPERTY(quint64 likedTracksRevision READ likedTracksRevision NOTIFY likedTracksChanged)
   Q_PROPERTY(
       QVariantList onlinePlaylists READ recommendations NOTIFY discoverChanged)
   Q_PROPERTY(
@@ -34,9 +36,11 @@ class CollectionService final : public QObject {
   Q_PROPERTY(QString homeError READ homeError NOTIFY homeStateChanged)
 public:
   explicit CollectionService(infrastructure::database::Database &db,
-                             QObject *parent = nullptr);
+                             QObject *parent = nullptr,
+                             QNetworkAccessManager *network = nullptr);
   void setBilibiliClient(online::BilibiliClient* client) { bilibili_=client; }
   QVariantList playlists() const { return lists_; }
+  quint64 likedTracksRevision() const { return likedTracksRevision_; }
   QVariantList recommendations() const { return recommendations_; }
   QVariantList charts() const { return charts_; }
   QVariantList tags() const { return tags_; }
@@ -68,6 +72,7 @@ public:
   Q_INVOKABLE void openTitle(const QString &title);
   Q_INVOKABLE void openLink(const QString &link);
   Q_INVOKABLE void cancelDetail();
+  Q_INVOKABLE void releaseDetail();
   Q_INVOKABLE bool isSaved(const QVariantMap &collection) const;
   Q_INVOKABLE void toggleSaved(const QVariantMap &collection);
   Q_INVOKABLE bool isTrackLiked(const QVariantMap &track) const;
@@ -82,14 +87,19 @@ signals:
   void homeStateChanged();
   void platformChanged();
   void playlistsChanged();
+  void likedTracksChanged();
   void discoverChanged();
   void detailChanged();
   void notice(const QString &message);
 
 private:
   infrastructure::database::Database &db_;
-  QNetworkAccessManager network_;
+  QNetworkAccessManager ownedNetwork_;
+  QNetworkAccessManager *network_;
   QVariantList lists_, recommendations_, charts_, tags_;
+  QSet<QString> likedTrackKeys_;
+  quint64 likedTracksRevision_{0};
+  void refreshLikedTrackIndex();
   QVariantList homeRecommendations_, homeCharts_, homePreviews_, dailyTracks_;
   QString homeError_, dailySource_{"网易云每日推荐"};
   QDateTime homeFetchedAt_;
@@ -107,12 +117,19 @@ private:
   quint64 discoveryGeneration_{0}, detailGeneration_{0};
   bool detailBusy_{false};
   QPointer<QNetworkReply> detailReply_;
+  QStringList detailTrackIds_;
+  QHash<QString, QVariantMap> detailTracksById_;
+  QSet<QByteArray> detailPageDigests_;
   QPointer<online::BilibiliClient> bilibili_;
   QString bilibiliDetailId_;
   bool save(const QVariantList &lists);
   int index(const QString &id) const;
   void page(int number, quint64 generation);
   void albumPage(int number, quint64 generation);
+  void remotePlaylist(quint64 generation);
+  void neteaseTracks(int offset, quint64 generation);
+  void kugouPage(int number, int received, quint64 generation);
+  void finishRemoteDetail(const QString &error = {});
   QNetworkReply *get(const QUrl &url,
                      std::function<void(QJsonObject, QString)> done);
 };

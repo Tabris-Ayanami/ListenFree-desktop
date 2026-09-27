@@ -203,6 +203,8 @@ QNetworkReply *platformRequest(QNetworkAccessManager &network, const QString &p,
       url = "https://music.163.com/api/v1/album/" + e;
     else if (op == "song")
       url = "https://music.163.com/api/song/detail/?ids=[" + e + "]&id=" + e;
+    else if (op == "songs")
+      url = "https://music.163.com/api/song/detail/?ids=[" + e + "]";
     else if (op == "suggest")
       url = "https://music.163.com/api/search/suggest/web?s=" + e;
     else if (op == "lists")
@@ -236,6 +238,9 @@ QNetworkReply *platformRequest(QNetworkAccessManager &network, const QString &p,
       url = "https://m.kugou.com/plist/index?json=true";
     else if (op == "detail")
       url = "https://m.kugou.com/plist/list/" + e + "/?json=true";
+    else if (op == "playlistSongs")
+      url = "https://mobiles.kugou.com/api/v3/special/song?specialid=" + e +
+            paging + "&version=9108&plat=0&area_code=0&with_res_tag=0";
   } else if (p == "tx") {
     headers["Referer"] = "https://y.qq.com/";
     headers["User-Agent"] = "QQMusic 14090508(android 12)";
@@ -359,7 +364,8 @@ QVariantList platformSongs(const QString &p, const QJsonObject &o) {
                       .toObject()
                       .value("info")
                       .toArray()
-                : o.value("data").toObject().value("lists").toArray();
+                : o.value("data").toObject().value(
+                      o.value("data").toObject().contains("info") ? "info" : "lists").toArray();
   else if (p == "tx") {
     const auto data = o.value("req").toObject().value("data").toObject();
     array = data.value("body")
@@ -617,6 +623,13 @@ QVariantMap platformDetail(const QString &p, const QJsonObject &object) {
     result["artwork"] = o.value("coverImgUrl").toString();
     result["total"] = o.value("trackCount").toInt();
     result["playCount"] = o.value("playCount").toVariant();
+  } else if (p == "kg") {
+    const auto info = object.value("info").toObject().value("list").toObject();
+    const auto list = object.value("list").toObject().value("list").toObject();
+    result["title"] = clean(info.value("specialname"));
+    result["artwork"] = info.value("imgurl").toString().replace("{size}", "400");
+    result["playCount"] = info.value("playcount").toVariant();
+    result["total"] = list.value("total").toVariant().toInt();
   }
   return result;
 }

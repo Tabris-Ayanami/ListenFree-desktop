@@ -5,10 +5,10 @@ import argparse,ctypes,json,os,pathlib,re,shutil,subprocess,sys
 root=pathlib.Path(__file__).resolve().parents[2]
 probe=root/'build/performance-optimization/probe';probe.mkdir(parents=True,exist_ok=True)
 shutil.copy2(pathlib.Path(__file__).with_name('immersive_memory_probe.h'),probe/'immersive_memory_probe.h')
-parser=argparse.ArgumentParser();parser.add_argument('--runtime',type=pathlib.Path,default=probe.parent/'runtime');parser.add_argument('--build-dir',type=pathlib.Path,default=root/'build/performance-verify');parser.add_argument('--link-only',action='store_true');parser.add_argument('--heap-manifest',type=pathlib.Path);parser.add_argument('--legacy-heap',action='store_true');options=parser.parse_args()
+parser=argparse.ArgumentParser();parser.add_argument('--runtime',type=pathlib.Path,default=probe.parent/'runtime');parser.add_argument('--runtime-source',type=pathlib.Path,default=root/'dist/ListenFree-Portable');parser.add_argument('--build-dir',type=pathlib.Path,default=root/'build/performance-verify');parser.add_argument('--link-only',action='store_true');parser.add_argument('--heap-manifest',type=pathlib.Path);parser.add_argument('--legacy-heap',action='store_true');options=parser.parse_args()
 build_dir=options.build_dir.resolve()
 runtime=options.runtime.resolve();runtime.mkdir(parents=True,exist_ok=True)
-shutil.copytree(root/'dist/ListenFree-Portable',runtime,dirs_exist_ok=True,ignore=shutil.ignore_patterns('data','listenfree.exe'))
+shutil.copytree(options.runtime_source,runtime,dirs_exist_ok=True,ignore=shutil.ignore_patterns('data','listenfree.exe'))
 for name in ['libqmmp.dll','libqmmpui.dll']:
     if (build_dir/name).exists():shutil.copy2(build_dir/name,runtime/name)
 main=(root/'src/app/main.cpp').read_text(encoding='utf-8-sig')
@@ -40,7 +40,7 @@ main+='''
             }
         }
     }
-    runImmersiveMemoryProbe(app,mainWindow,mainShell,controller,settingsController,immersive,sourceController,arguments);
+    runImmersiveMemoryProbe(app,mainWindow,mainShell,controller,settingsController,immersive,sourceController,playlistController,arguments);
     return app.exec();
 }
 '''

@@ -3,6 +3,7 @@
 #include <QVariantList>
 #include <QTextBoundaryFinder>
 #include <QTextLayout>
+#include <QFontMetricsF>
 #include <algorithm>
 #include <cmath>
 
@@ -15,9 +16,21 @@ public:
     using QObject::QObject;
     Q_INVOKABLE QVariantList prepare(const QVariantList& words, const QFont& font) const {
         QVariantList result;
+        const QFontMetricsF fontMetrics(font);
         for (const auto& value : words) {
             auto token = value.toMap();
-            const QString text = token.value("text").toString();
+            const QString original = token.value("text").toString();
+            qsizetype firstInk = 0, afterInk = original.size();
+            while (firstInk < afterInk && original[firstInk].isSpace()) ++firstInk;
+            while (afterInk > firstInk && original[afterInk-1].isSpace()) --afterInk;
+            const QString text = original.mid(firstInk, afterInk-firstInk);
+            // As in AMLL's trimmed word spans, whitespace reserves layout
+            // advance without consuming any of the audible word's sweep.
+            const qreal leading = firstInk ? fontMetrics.horizontalAdvance(original.first(firstInk)) : 0;
+            const qreal trailing = afterInk < original.size() ? fontMetrics.horizontalAdvance(original.mid(afterInk)) : 0;
+            token.insert("displayText", text);
+            token.insert("leadingSpace", leading);
+            token.insert("trailingSpace", trailing);
             QTextLayout layout(text, font);
             layout.beginLayout();
             auto line = layout.createLine();
@@ -36,7 +49,7 @@ public:
                 from = to;
             }
             token.insert("glyphs", glyphs);
-            token.insert("advance", width);
+            token.insert("advance", leading + width + trailing);
             token.insert("charCount", ordinal);
             token.insert("emphasized", false);
             result.append(token);
@@ -44,6 +57,8 @@ public:
 
         // Adjacent Latin syllables without whitespace share one emphasis
         // envelope. Preserve supplied CJK timings instead of inventing splits.
+        int lastVisible = int(result.size())-1;
+        while (lastVisible >= 0 && result[lastVisible].toMap().value("charCount").toInt() == 0) --lastVisible;
         int first = 0;
         while (first < result.size()) {
             int last = first;
@@ -66,11 +81,21 @@ public:
                 emphasize |= shouldEmphasize(token.value("text").toString(), e-s);
             }
             emphasize |= !isCjk(merged.trimmed()) && shouldEmphasize(merged, end-start);
-            const QString tail = words.isEmpty() ? QString{} : words.last().toMap().value("text").toString();
-            const bool final = !tail.isEmpty() && merged.contains(tail);
+            // Equal text earlier in a line is not its final word. Empty trailing
+            // timing tokens also must not take the last sung group's emphasis.
+            const bool final = first <= lastVisible && lastVisible <= last;
             const qreal duration = std::max(1000., end-start);
-            const qreal amount = std::min(1.2, .6 * shape(duration/2000) * (final ? 1.6 : 1));
-            const qreal glow = std::min(.8, .5 * shape(duration/3000) * (final ? 1.5 : 1));
+            // The original iPad samples retain visible expansion for 1–2 s
+            // notes. Cubing this ratio almost removes those eligible notes'
+            // emphasis. Keep the existing >2 s curve and upper bound.
+            const qreal strength = duration/2000;
+            const qreal amount = std::min(1.2, .6 * (strength <= 1 ? strength : std::sqrt(strength))
+                * (final ? 1.6 : 1));
+            // Short sustained notes still have a soft halo in the reference.
+            // Tie its minimum energy to the visible emphasis, not a second
+            // cubic attenuation that nearly eliminates 1-2 s notes.
+            const qreal glow = std::min(.8, std::max(.5 * amount,
+                .5 * shape(duration/3000) * (final ? 1.5 : 1)));
             int offset = 0;
             for (int i = first; i <= last; ++i) {
                 auto token = result[i].toMap();

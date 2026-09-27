@@ -441,11 +441,13 @@ inline void runAppearanceRegression(QApplication& app, QQuickWindow* window, QOb
             fixture->setData(R"qml(import QtQuick
 QtObject {
  property var lyricCandidates: []
+ property var lyricMatchSources: []
  property var lyricPreviewLines: []
  property string lyricPreview: "fixture"
  property bool lyricMatchBusy: false
  property string lyricMatchError: ""
  function cancelLyricMatch() {}
+ function releaseLyricMatch() { lyricPreviewLines=[];lyricCandidates=[];lyricPreview="" }
 })qml",qmlContext(shell)->baseUrl());
             state->phase=428;return;
         }
@@ -781,12 +783,12 @@ QtObject {
             capture("missing-cover");finish();return;
         }
         case 334:
-            if(int(state->flowPhase)%2)window->showFullScreen();else{window->showNormal();window->resize(1066,709);}
+            if(int(state->flowPhase)%2)window->showFullScreen();else{window->showNormal();window->resize(1040,709);}
             return;
         case 335:
             QMetaObject::invokeMethod(item("libraryAlbumGrid"),"positionViewAtIndex",Q_ARG(int,int(state->barSize)),Q_ARG(int,1));state->flowWait=0;state->phase=332;return;
         case 300:
-            window->showNormal();window->resize(1066,709);
+            window->showNormal();window->resize(1040,709);
             shell->setProperty("settingsOpen",false);shell->setProperty("nowPlayingOpen",false);shell->setProperty("sidebarCollapsed",false);
             settings.setValue("appearance.albumLayout","Flow");shell->setProperty("currentRoute","library/albums");return;
         case 301: {
@@ -822,7 +824,7 @@ QtObject {
         }
         case 307:
             state->checks["settings_fills_window"]=qAbs(item("settingsPage")->mapToScene({0,item("settingsPage")->height()}).y()-window->height())<1;
-            capture("fullscreen-settings");shell->setProperty("settingsOpen",false);shell->setProperty("currentRoute","library/albums");window->showNormal();window->resize(1066,709);return;
+            capture("fullscreen-settings");shell->setProperty("settingsOpen",false);shell->setProperty("currentRoute","library/albums");window->showNormal();window->resize(1040,709);return;
         case 308: {
             auto* flow=item("libraryAlbumFlow");auto* card=item("albumCard"+QString::number(flow->parentItem()->property("selectedAlbumIndex").toInt()));
             state->checks["restore_flow_card_size"]=qAbs(card->width()-state->previewWidth)<.1;
@@ -858,7 +860,7 @@ QtObject {
             capture("ultrawide-flow");finish();return;
         }
         case 280:
-            window->showNormal();window->resize(1066,709);
+            window->showNormal();window->resize(1040,709);
             shell->setProperty("settingsOpen",false);shell->setProperty("animationsEnabled",false);
             shell->setProperty("nowPlayingOpen",true);shell->setProperty("morphProgress",1.0);shell->setProperty("coverMorphProgress",1.0);return;
         case 281: case 282: case 283: case 284: case 285: case 286: case 287: {
@@ -881,7 +883,7 @@ QtObject {
             else if(index==2){capture("16-10");window->resize(1920,800);}
             else if(index==3){capture("ultrawide");window->showMaximized();}
             else if(index==4){window->showFullScreen();}
-            else if(index==5){capture("fullscreen");window->showNormal();window->resize(1066,709);}
+            else if(index==5){capture("fullscreen");window->showNormal();window->resize(1040,709);}
             else {state->checks["restore_preserves_default_layout"]=qAbs(art.width()-state->previewWidth)<.1;capture("restored");finish();}
             return;
         }
@@ -1321,7 +1323,7 @@ QtObject {
             state->checks["watch_toggle_visible"]=item("settingRow/library.autoWatch")&&item("settingRow/library.autoWatch")->isVisible();
             capture("watch-setting");finish();return;
         case 150:
-            window->resize(1066,709);
+            window->resize(1040,709);
             shell->setProperty("settingsOpen",false);shell->setProperty("nowPlayingOpen",false);
             shell->setProperty("currentRoute","my-lists");shell->setProperty("darkMode",false);
             shell->setProperty("animationsEnabled",true);settings.setValue("ui.motionEnabled",true);
@@ -1329,8 +1331,8 @@ QtObject {
             player.clearQueue();player.enqueueTrack(player.songs().first().toMap());player.selectQueue(0,false);return;
         case 151:
             if(++state->flowWait<3){--state->phase;return;}
-            state->checks["default_window_size"]=window->width()==1066&&window->height()==709;
-            state->checks["miniplayer_fits_window"]=item("floatingPlayer")->x()+item("floatingPlayer")->width()<=window->width()-20;
+            state->checks["default_window_size"]=window->width()==1040&&window->height()==709;
+            state->checks["miniplayer_fits_window"]=item("floatingPlayer")->x()+item("floatingPlayer")->width()<=window->width()-12;
             state->checks["reference_sigma_pixels"]=qAbs(item("globalBackground")->property("blurRadius").toDouble()-window->width()*.03)<.1;
             {
                 const auto frame=window->grabWindow();
@@ -1435,7 +1437,7 @@ QtObject {
                 &&window->grabWindow().pixelColor(0,0).alpha()>240;
             window->showNormal();return;
         case 165:
-            state->checks["restored_has_rounded_corners"]=window->property("cornerRadius").toDouble()==8
+            state->checks["restored_has_rounded_corners"]=window->property("cornerRadius").toDouble()==32
                 &&window->grabWindow().pixelColor(0,0).alpha()<10;
             finish();return;
         case 180:

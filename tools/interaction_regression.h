@@ -82,7 +82,7 @@ inline void runUiRegression(QApplication& app, QQuickWindow* window, QObject* sh
             state->measures["expected_artists"]=player.artists().size();
             state->checks["library_backend_song_model_matches_catalog"]=
                 player.tracksModel()->rowCount()==player.songs().size();
-            window->resize(1066,709);window->show();
+            window->resize(1040,709);window->show();
             settings.setValue("ui.animations",false);
             shell->setProperty("settingsOpen",false);
             shell->setProperty("nowPlayingOpen",false);
@@ -165,7 +165,7 @@ inline void runUiRegression(QApplication& app, QQuickWindow* window, QObject* sh
         }
         case 300: {
             if (!player.ready()) { --state->phase; return; }
-            window->resize(1066,709);window->show();
+            window->resize(1040,709);window->show();
             settings.setValue("ui.animations",false);
             settings.setValue("playback.playActionBehavior","ReplaceCurrentList");
             const QDir dataDir(qApp->property("listenfreeDataDir").toString());
@@ -242,8 +242,24 @@ inline void runUiRegression(QApplication& app, QQuickWindow* window, QObject* sh
                 player.currentTrack().value("localPath")==state->song.value("localPath") && player.state()=="Playing";
             state->measures["play_action_queue_count"]=queue.size();
             state->measures["play_action_state"]=player.state();
+            collections.toggleTrackLiked(state->song);
+            state->phase=320;return;
+        }
+        case 320: {
+            auto* row=uiSongRowForPath(item("playlistDetailTracks"),state->song.value("localPath").toString());
+            auto* floating=item("floatingPlayer");
+            state->checks["favorite_membership_updates_row_and_player"]=row && row->property("liked").toBool() &&
+                floating && floating->property("favorite").toBool();
+            collections.toggleTrackLiked(state->song);
+            state->phase=321;return;
+        }
+        case 321: {
+            auto* row=uiSongRowForPath(item("playlistDetailTracks"),state->song.value("localPath").toString());
+            auto* floating=item("floatingPlayer");
+            state->checks["unfavorite_membership_updates_row_and_player"]=row && !row->property("liked").toBool() &&
+                floating && !floating->property("favorite").toBool();
             QMetaObject::invokeMethod(shell,"openNowPlaying");
-            state->count=0;return;
+            state->count=0;state->phase=304;return;
         }
         case 304: {
             auto* star=item("nowPlayingFavoriteButton");
@@ -308,6 +324,7 @@ inline void runUiRegression(QApplication& app, QQuickWindow* window, QObject* sh
             const auto retained=shell->property("selectedCollectionRows");
             state->checks["leaving_detail_releases_song_rows"]=(retained.canConvert<QJSValue>()
                 ? retained.value<QJSValue>().toVariant().toList() : retained.toList()).isEmpty();
+            state->checks["leaving_detail_releases_backend_snapshot"]=collections.detail().isEmpty() && !collections.detailBusy();
             state->pressed=uiSongRowForPath(table,state->fixtureRows.at(1).toMap().value("localPath").toString());
             state->checks["filtered_song_row_matches_query"]=state->pressed && state->pressed->isVisible();
             if(auto* row=state->pressed.data())if(auto* button=uiItem(row,"songRowPlay"))
@@ -336,7 +353,7 @@ inline void runUiRegression(QApplication& app, QQuickWindow* window, QObject* sh
         }
         case 200: {
             if(!player.ready()){--state->phase;return;}
-            player.stop();window->resize(1066,709);
+            player.stop();window->resize(1040,709);
             window->setFlag(Qt::WindowDoesNotAcceptFocus,true);window->show();
             settings.setValue("ui.animations",false);
             settings.setValue("background.type","Color");settings.setValue("background.color","#18202a");

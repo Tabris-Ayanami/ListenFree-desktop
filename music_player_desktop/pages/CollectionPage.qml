@@ -101,7 +101,8 @@ Item {
         }
         SongTable {
             objectName: "playlistDetailTracks"
-            x: 24; y: playlistHeader.y + playlistHeader.height + 22; width: parent.width-48; height: parent.height-y-96
+            x: 24; y: playlistHeader.y + playlistHeader.height + 22; width: parent.width-48; height: parent.height-y-6
+            // Tracks continue behind the glass island without a reserved tail.
             rows: page.visibleRows; fallbackArtwork: page.artworkSource
             playlistMode: page.editablePlaylist
             scrollKey: "collection." + page.kind + "." + page.title

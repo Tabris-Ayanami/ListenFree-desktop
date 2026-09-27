@@ -19,6 +19,8 @@ public:
     ~LyricSearch() override;
     void search(const QVariantMap& track, const QString& query, const QString& source = "all");
     void cancel();
+    // End the preview session; successful bounded caches and backoff survive.
+    void release();
     bool busy() const { return busy_; }
     QVariantList results() const { return results_; }
     QVariantList sources() const;

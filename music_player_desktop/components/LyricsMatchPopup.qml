@@ -41,7 +41,8 @@ Basic.Popup {
     closePolicy: Basic.Popup.CloseOnEscape | Basic.Popup.CloseOnPressOutside
     onOpened: AppTheme.presentPopup(popup)
     onClosed: {
-        if(controller)controller.cancelLyricMatch()
+        if(controller)controller.releaseLyricMatch()
+        selectedKey="";sourceFilter="all";track=({});query.text=""
         if(AppTheme.currentPopup===popup)AppTheme.currentPopup=null
     }
     background: Rectangle { radius: 24; color: AppTheme.darkMode ? "#252d36" : "#f7f8fb"; border.color: AppTheme.border }
@@ -156,12 +157,19 @@ Basic.Popup {
             Text { x: 18; y: 14; width: parent.width-36; text: popup.selected.title || qsTr("歌词预览"); elide: Text.ElideRight; color: AppTheme.textPrimary; font.family: AppTheme.fontFamily; font.pixelSize: 14; font.weight: Font.DemiBold }
             Text { x: 18; y: 37; width: parent.width-36; text: popup.selected.artist || qsTr("选择左侧结果，查看原文与译文"); elide: Text.ElideRight; color: AppTheme.textSecondary; font.family: AppTheme.fontFamily; font.pixelSize: 10 }
             Rectangle { x: 18; y: 61; width: parent.width-36; height: 1; color: AppTheme.divider; opacity: .5 }
-            Flickable {
+            ListView {
                 id: preview
                 objectName: "lyricMatchPreview"
                 x: 18; y: 76; width: parent.width-28; height: parent.height-y-16
                 clip: true; boundsBehavior: Flickable.StopAtBounds
-                contentWidth: width; contentHeight: lines.height
+                contentWidth: width
+                spacing: 18
+                reuseItems: true
+                cacheBuffer: Math.max(0, height)
+                currentIndex: -1
+                model: popup.visible && popup.controller ? popup.controller.lyricPreviewLines : []
+                onModelChanged: positionViewAtBeginning()
+                Component.onCompleted: contentItem.objectName="lyricMatchPreviewLines"
                 MouseArea {
                     parent: preview
                     anchors.fill: parent
@@ -176,25 +184,18 @@ Basic.Popup {
                 }
                 // Keep the gutter stable during scrolling; reclaim it only when
                 // the user explicitly hides all scrollbars.
-                Column {
-                    id: lines
-                    objectName: "lyricMatchPreviewLines"
-                    width: preview.width; spacing: 18
-                    Repeater {
-                        model: popup.controller ? popup.controller.lyricPreviewLines : []
-                        onModelChanged: preview.contentY=0
-                        delegate: Row {
-                            id: line
-                            required property var modelData
-                            width: lines.width; spacing: 12
-                            Text { width: 33; y: 3; text: popup.time(line.modelData.timeMs); color: AppTheme.textMuted; font.family: "Consolas"; font.pixelSize: 10 }
-                            Column {
-                                width: parent.width-45; spacing: 5
-                                Text { width: parent.width; text: line.modelData.text || "♪"; wrapMode: Text.Wrap; color: AppTheme.textPrimary; font.family: AppTheme.fontFamily; font.pixelSize: 14; lineHeight: 1.25 }
-                                Text { width: parent.width; visible: text.length>0; text: line.modelData.translation || ""; wrapMode: Text.Wrap; color: AppTheme.textSecondary; font.family: AppTheme.fontFamily; font.pixelSize: 12; lineHeight: 1.15 }
-                                Text { width: parent.width; visible: text.length>0; text: line.modelData.romanization || ""; wrapMode: Text.Wrap; color: AppTheme.textMuted; font.family: AppTheme.fontFamily; font.pixelSize: 11; lineHeight: 1.15 }
-                            }
-                        }
+                delegate: Row {
+                    id: line
+                    required property var modelData
+                    required property int index
+                    objectName: "lyricMatchPreviewLine"
+                    width: preview.width; spacing: 12
+                    Text { width: 33; y: 3; text: popup.time(line.modelData.timeMs); color: AppTheme.textMuted; font.family: "Consolas"; font.pixelSize: 10 }
+                    Column {
+                        width: parent.width-45; spacing: 5
+                        Text { width: parent.width; text: line.modelData.text || "♪"; wrapMode: Text.Wrap; color: AppTheme.textPrimary; font.family: AppTheme.fontFamily; font.pixelSize: 14; lineHeight: 1.25 }
+                        Text { width: parent.width; visible: text.length>0; text: line.modelData.translation || ""; wrapMode: Text.Wrap; color: AppTheme.textSecondary; font.family: AppTheme.fontFamily; font.pixelSize: 12; lineHeight: 1.15 }
+                        Text { width: parent.width; visible: text.length>0; text: line.modelData.romanization || ""; wrapMode: Text.Wrap; color: AppTheme.textMuted; font.family: AppTheme.fontFamily; font.pixelSize: 11; lineHeight: 1.15 }
                     }
                 }
                 Basic.ScrollBar.vertical: StableScrollBar { objectName: "lyricMatchPreviewScrollbar" }

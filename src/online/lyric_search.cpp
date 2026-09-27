@@ -4,6 +4,7 @@
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QJsonDocument>
+#include <QSignalBlocker>
 #include <algorithm>
 #include <utility>
 
@@ -30,6 +31,15 @@ LyricSearch::LyricSearch(QNetworkAccessManager& network, QObject* parent, int re
 }
 LyricSearch::~LyricSearch() { blockSignals(true); stop(false); }
 void LyricSearch::cancel() { stop(false); }
+void LyricSearch::release() {
+    {
+        const QSignalBlocker blocker(this);
+        stop(false);
+    }
+    providers_.clear(); sourceOrder_.clear(); results_.clear(); texts_.clear();
+    track_.clear(); query_.clear(); searchKey_.clear();
+    emit changed();
+}
 void LyricSearch::stop(bool timedOut) {
     deadline_.stop();
     ++generation_; // Invalidate before abort(): finished may be emitted synchronously.

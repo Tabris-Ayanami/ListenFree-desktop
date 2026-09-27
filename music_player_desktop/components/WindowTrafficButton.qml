@@ -12,7 +12,7 @@ Item {
     signal clicked
 
     implicitWidth: 22
-    implicitHeight: 22
+    implicitHeight: AppTheme.toolbarControlHeight
 
     Rectangle {
         id: dot

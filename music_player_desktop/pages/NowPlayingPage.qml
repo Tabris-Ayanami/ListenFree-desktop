@@ -558,8 +558,8 @@ Item {
         id: windowControls
         z: 4
         anchors.right: parent.right
-        anchors.rightMargin: 9
-        y: 7
+        anchors.rightMargin: AppTheme.normalWindowCornerRadius - closeWindowControl.width / 2 - 4
+        y: (AppTheme.toolbarHeight - AppTheme.toolbarControlHeight) / 2
         spacing: 10
         HeaderGlyph { objectName: "nowPlayingCloseButton"; kind: "chevronDown"; onClicked: page.closeRequested() }
         HeaderGlyph { objectName: "nowPlayingThemeButton"; kind: page.darkMode ? "moon" : "sun"; onClicked: page.themeToggleRequested() }
@@ -584,6 +584,7 @@ Item {
                 }
             }
             WindowTrafficButton {
+                id: closeWindowControl
                 action: "close"
                 fillColor: "#ff5f57"
                 revealGlyph: nowPlayingTrafficHover.hovered || Qt.application.arguments.indexOf("nowplaying-traffic-hover") >= 0
@@ -678,9 +679,9 @@ Item {
     component HeaderGlyph: Item {
         property string kind: "globe"
         signal clicked
-        width: 22
-        height: 22
-        IconGlyph { anchors.fill: parent; kind: parent.kind; glyphColor: "#e9e6e7"; strokeWidth: 1.2 }
+        width: AppTheme.toolbarControlHeight
+        height: AppTheme.toolbarControlHeight
+        IconGlyph { anchors.centerIn: parent; width: 22; height: 22; kind: parent.kind; glyphColor: "#e9e6e7"; strokeWidth: 1.2 }
         TapHandler { gesturePolicy: TapHandler.ReleaseWithinBounds; onTapped: parent.clicked() }
     }
     component FooterGlyph: Item {

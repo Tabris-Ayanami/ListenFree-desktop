@@ -41,6 +41,7 @@ Item {
     property alias artworkSource: cover.source
     property real expandedWidth: 1173
     property real collapsedWidth: 166
+    readonly property real cornerRadius: collapsed ? 31 : AppTheme.expandedPlayerCornerRadius
 
     // AppShell reads these values for the island -> NowPlaying cover morph.
     // They must always describe the actual on-screen cover geometry.
@@ -101,7 +102,7 @@ Item {
         visible: !root.surfaceInTransition
         blockInput: true
         anchors.fill: parent
-        cornerRadius: root.collapsed ? 31 : 24
+        cornerRadius: root.cornerRadius
         backdrop: root.backdrop
         opaqueBackdropBase: false
         backdropBlur: root.glassBlur

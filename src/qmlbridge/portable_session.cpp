@@ -161,14 +161,16 @@ QJsonObject kuwoJson(QByteArray bytes) {
 }
 QVariantMap PortableSession::toMap(const domain::Track& track) {
     const auto duration = static_cast<qint64>(track.duration.count());
-    return {{"trackId", s(track.id.value())}, {"title", s(track.title)},
-            {"artist", track.artists.empty() ? QString{} : s(track.artists.front().name)},
-            {"album", track.album ? s(track.album->title) : QString{}},
-            {"durationMs", duration}, {"duration", timeLabel(duration)},
-            {"localPath", track.localPath ? s(*track.localPath) : QString{}},
-            {"remoteUrl", track.remoteUrl ? s(*track.remoteUrl) : QString{}},
-            {"artwork", track.localPath ? localArtworkUrl(s(*track.localPath)) : (track.album && track.album->artworkUrl ? s(*track.album->artworkUrl) : QString{})},
-            {"source", track.localPath ? "Local" : "Online"}};
+    // Catalog rows retain these keys for the session; share their static data
+    // instead of allocating identical field names for every track.
+    return {{QStringLiteral("trackId"), s(track.id.value())}, {QStringLiteral("title"), s(track.title)},
+            {QStringLiteral("artist"), track.artists.empty() ? QString{} : s(track.artists.front().name)},
+            {QStringLiteral("album"), track.album ? s(track.album->title) : QString{}},
+            {QStringLiteral("durationMs"), duration}, {QStringLiteral("duration"), timeLabel(duration)},
+            {QStringLiteral("localPath"), track.localPath ? s(*track.localPath) : QString{}},
+            {QStringLiteral("remoteUrl"), track.remoteUrl ? s(*track.remoteUrl) : QString{}},
+            {QStringLiteral("artwork"), track.localPath ? localArtworkUrl(s(*track.localPath)) : (track.album && track.album->artworkUrl ? s(*track.album->artworkUrl) : QString{})},
+            {QStringLiteral("source"), track.localPath ? QStringLiteral("Local") : QStringLiteral("Online")}};
 }
 domain::Track PortableSession::toTrack(const QVariantMap& map) {
     domain::Track track;

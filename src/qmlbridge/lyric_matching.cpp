@@ -144,6 +144,11 @@ QString lyricKey(const QVariantMap& track) {
 }
 }
 void PortableSession::cancelLyricMatch() { lyricSearch_.cancel(); }
+void PortableSession::releaseLyricMatch() {
+    lyricPreview_.clear(); lyricPreviewLines_.clear();
+    lyricSearch_.release();
+    emit lyricPreviewChanged();
+}
 QVariantMap PortableSession::lyricMatchSeed(const QVariantMap& track) const {
     auto seed=readTrackTags(track);
     const auto clean=[](QString text) {
