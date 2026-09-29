@@ -1365,6 +1365,7 @@ Item {
             }
             onVolumeChangedByUser: function(value) { if (shell.playerController) shell.playerController.setVolume(value) }
             onCycleModeRequested: if(shell.playerController)shell.playerController.cyclePlaybackMode()
+            onEndlessModeRequested: if(shell.playerController)shell.playerController.setPlaybackMode(shell.playerController.playbackMode === "endless" ? "listLoop" : "endless")
             onMuteToggleRequested: if(shell.playerController)shell.playerController.toggleMute()
 
         }
@@ -2066,6 +2067,7 @@ Item {
             playbackMode: shell.playerController ? shell.playerController.playbackMode : "listLoop"
             localTrack: !!shell.displayedTrack.localPath
             onCycleModeRequested: if(shell.playerController)shell.playerController.cyclePlaybackMode()
+            onEndlessModeRequested: if(shell.playerController)shell.playerController.setPlaybackMode(shell.playerController.playbackMode === "endless" ? "listLoop" : "endless")
             onEqualizerRequested: equalizerPopup.open()
             onInformationRequested: shell.openMusicEditor(shell.displayedTrack)
             onDownloadRequested: shell.chooseDownload([shell.displayedTrack])

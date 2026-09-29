@@ -37,7 +37,9 @@ try {
             '-DLISTENFREE_BUILD_TESTS=ON','-DLISTENFREE_BUILD_QMMP_BACKEND=ON','-DLISTENFREE_BUILD_MPV_BACKEND=OFF',
             "-DLISTENFREE_QMMP_SOURCE_ROOT=$vendor/qmmp-2.4.1",
             "-DLISTENFREE_QMMP_LIBRARY=$qmmp/libqmmp.dll.a", "-DLISTENFREE_QMMP_RUNTIME=$qmmp/libqmmp.dll",
-            "-DLISTENFREE_QMMP_UI_LIBRARY=$qmmpUi/libqmmpui.dll.a", "-DLISTENFREE_QMMP_PLUGIN_ROOT=$qmmp")
+            "-DLISTENFREE_QMMP_UI_LIBRARY=$qmmpUi/libqmmpui.dll.a", "-DLISTENFREE_QMMP_PLUGIN_ROOT=$qmmp",
+            "-DLISTENFREE_LIVE_FFMPEG_ROOT=$vendor/qmmp-vcpkg-installed-qt/x64-mingw-dynamic",
+            "-DLISTENFREE_WINSPARKLE_ROOT=$vendor/winsparkle-0.9.4/WinSparkle-0.9.4")
         Invoke-Checked $cmake @('--build',$buildDir,'--target','listenfree','listenfree-sourcehost','--parallel','4')
     }
     $resolvedStage=[IO.Path]::GetFullPath($stage)

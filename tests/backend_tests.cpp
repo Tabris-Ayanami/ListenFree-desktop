@@ -158,6 +158,8 @@ private slots:
     void sourceHostCrashRecovery();
     void sourceHostStopPreventsRestart();
     void sourceHostBoundsPendingRequests();
+    void sourceHostSupportsBrowserTimers();
+    void sourceHostKeepsSuccessfulInitAfterLateException();
     void mockProvider();
     void listModels();
     void filteredTrackModelPreservesRowsAndUpdates();
@@ -2178,6 +2180,108 @@ void BackendTests::listModels() {
     QCOMPARE(model.property("count").toInt(), 0);
     QCOMPARE(countChanged.count(), 2);
     QVERIFY(model.get(0).isEmpty());
+}
+
+void BackendTests::sourceHostSupportsBrowserTimers() {
+    const QString executable = QCoreApplication::applicationDirPath() + QStringLiteral("/listenfree-sourcehost.exe");
+    QVERIFY(QFileInfo::exists(executable));
+    QTemporaryDir temp;
+    QVERIFY(temp.isValid());
+    QFile plugin(temp.filePath(QStringLiteral("timer-source.js")));
+    QVERIFY(plugin.open(QIODevice::WriteOnly));
+    const QByteArray source = R"JS(/*
+ * @name Timer source
+ * @author ListenFree
+ */
+if (lx.currentScriptInfo.name !== 'Timer source') throw new Error('script metadata mismatch')
+clearTimeout(setTimeout(() => lx.send(lx.EVENT_NAMES.updateAlert, {log: 'cancelled'}), 10))
+setTimeout(log => lx.send(lx.EVENT_NAMES.updateAlert, {log}), 20, 'timer-fired')
+lx.on(lx.EVENT_NAMES.request, () => Promise.resolve('https://media.invalid/timer.mp3'))
+lx.send(lx.EVENT_NAMES.inited, {
+    status: true,
+    sources: { kw: { type: 'music', actions: ['musicUrl'], qualitys: ['320k'] } }
+})
+)JS";
+    QCOMPARE(plugin.write(source), source.size());
+    plugin.close();
+
+    listenfree::sourcehost::SourceHostClient client(executable);
+    QSignalSpy readySpy(&client, &listenfree::sourcehost::SourceHostClient::ready);
+    QSignalSpy finishedSpy(&client, &listenfree::sourcehost::SourceHostClient::requestFinished);
+    QList<listenfree::sourcehost::SourceMessage> messages;
+    connect(&client, &listenfree::sourcehost::SourceHostClient::messageReceived, &client,
+            [&](const listenfree::sourcehost::SourceMessage& message) { messages.append(message); });
+    QVERIFY(client.start());
+    QTRY_COMPARE_WITH_TIMEOUT(readySpy.count(), 1, 2000);
+    listenfree::sourcehost::SourceMessage load;
+    load.type = listenfree::sourcehost::MessageType::LoadPlugin;
+    load.requestId = QStringLiteral("timer-load");
+    load.payload.insert(QStringLiteral("path"), plugin.fileName());
+    QVERIFY(client.request(load, 2000));
+    QTRY_COMPARE_WITH_TIMEOUT(finishedSpy.count(), 1, 1000);
+    QCOMPARE(finishedSpy.takeFirst().at(1).value<listenfree::sourcehost::SourceHostClient::RequestTerminal>(),
+             listenfree::sourcehost::SourceHostClient::RequestTerminal::Succeeded);
+    QTRY_VERIFY_WITH_TIMEOUT(std::any_of(messages.cbegin(), messages.cend(), [](const auto& message) {
+        return message.type == listenfree::sourcehost::MessageType::UpdateAlert;
+    }), 2000);
+    for (const auto& message : std::as_const(messages)) {
+        if (message.type == listenfree::sourcehost::MessageType::UpdateAlert)
+            QCOMPARE(message.payload.value(QStringLiteral("log")).toString(), QStringLiteral("timer-fired"));
+    }
+    client.stop();
+}
+
+void BackendTests::sourceHostKeepsSuccessfulInitAfterLateException() {
+    const QString executable = QCoreApplication::applicationDirPath() + QStringLiteral("/listenfree-sourcehost.exe");
+    QVERIFY(QFileInfo::exists(executable));
+    QTemporaryDir temp;
+    QVERIFY(temp.isValid());
+    QFile plugin(temp.filePath(QStringLiteral("late-error-source.js")));
+    QVERIFY(plugin.open(QIODevice::WriteOnly));
+    const QByteArray source = R"JS(/*
+ * @name Late error source
+ */
+lx.on(lx.EVENT_NAMES.request, () => Promise.resolve('https://media.invalid/still-works.mp3'))
+lx.send(lx.EVENT_NAMES.inited, {
+    status: true,
+    sources: { kw: { type: 'music', actions: ['musicUrl'], qualitys: ['128k'] } }
+})
+throw new Error('late initialization check')
+)JS";
+    QCOMPARE(plugin.write(source), source.size());
+    plugin.close();
+
+    listenfree::sourcehost::SourceHostClient client(executable);
+    QSignalSpy readySpy(&client, &listenfree::sourcehost::SourceHostClient::ready);
+    QSignalSpy finishedSpy(&client, &listenfree::sourcehost::SourceHostClient::requestFinished);
+    listenfree::sourcehost::SourceMessage lastMessage;
+    connect(&client, &listenfree::sourcehost::SourceHostClient::messageReceived, &client,
+            [&](const listenfree::sourcehost::SourceMessage& message) { lastMessage = message; });
+    QVERIFY(client.start());
+    QTRY_COMPARE_WITH_TIMEOUT(readySpy.count(), 1, 2000);
+    listenfree::sourcehost::SourceMessage load;
+    load.type = listenfree::sourcehost::MessageType::LoadPlugin;
+    load.requestId = QStringLiteral("late-error-load");
+    load.payload.insert(QStringLiteral("path"), plugin.fileName());
+    QVERIFY(client.request(load, 2000));
+    QTRY_COMPARE_WITH_TIMEOUT(finishedSpy.count(), 1, 1000);
+    QCOMPARE(finishedSpy.takeFirst().at(1).value<listenfree::sourcehost::SourceHostClient::RequestTerminal>(),
+             listenfree::sourcehost::SourceHostClient::RequestTerminal::Succeeded);
+    QCOMPARE(lastMessage.type, listenfree::sourcehost::MessageType::Result);
+
+    listenfree::sourcehost::SourceMessage resolve;
+    resolve.type = listenfree::sourcehost::MessageType::ResolveMusicUrl;
+    resolve.requestId = QStringLiteral("late-error-resolve");
+    resolve.payload = {{QStringLiteral("source"), QStringLiteral("kw")},
+                       {QStringLiteral("type"), QStringLiteral("128k")},
+                       {QStringLiteral("musicInfo"), QJsonObject{{QStringLiteral("rid"), QStringLiteral("song-1")}}}};
+    QVERIFY(client.request(resolve, 2000));
+    QTRY_COMPARE_WITH_TIMEOUT(finishedSpy.count(), 1, 1000);
+    QCOMPARE(finishedSpy.takeFirst().at(1).value<listenfree::sourcehost::SourceHostClient::RequestTerminal>(),
+             listenfree::sourcehost::SourceHostClient::RequestTerminal::Succeeded);
+    QCOMPARE(lastMessage.payload.value(QStringLiteral("data")).toObject().value(QStringLiteral("url")).toString(),
+             QStringLiteral("https://media.invalid/still-works.mp3"));
+    client.stop();
 }
 
 void BackendTests::filteredTrackModelPreservesRowsAndUpdates() {

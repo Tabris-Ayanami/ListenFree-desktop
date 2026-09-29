@@ -26,6 +26,10 @@ Item {
     readonly property real raisedShadowOffset: pressed ? 1 : 4
     property bool darkMode: false
     property bool reducedMotion: false
+    property bool holdEnabled: false
+    property int holdDuration: 700
+    property real holdProgress: 0
+    property bool holdConsumed: false
     property int volumeLevel: 3
     property real glyphRotation: 0
     property color glyphColor: darkMode ? "#eef2f5" : "#394149"
@@ -33,6 +37,7 @@ Item {
     property color surfaceColor: raisedSurface ? (darkMode ? "#e0444e58" : "#edf4f8fa")
                                              : darkMode ? (prominent ? "#30ffffff" : "#18ffffff") : (prominent ? "#32606a74" : "#22606a74")
     signal clicked
+    signal longPressed
     signal wheelScrolled(var event)
 
     width: diameter
@@ -77,6 +82,32 @@ Item {
         color: tap.pressed ? root.pressedColor : hover.hovered ? root.hoverColor : "transparent"
     }
 
+    Canvas {
+        id: holdRing
+        x: -3; y: -3
+        width: root.diameter + 6; height: width
+        visible: root.holdEnabled && root.holdProgress > 0
+        onPaint: {
+            const ctx = getContext("2d")
+            ctx.clearRect(0, 0, width, height)
+            const center = width / 2
+            const radius = center - 1.5
+            ctx.lineWidth = 1.5
+            ctx.strokeStyle = root.darkMode || root.transparentSurface ? "rgba(255,255,255,0.16)" : "rgba(57,65,73,0.16)"
+            ctx.beginPath(); ctx.arc(center, center, radius, 0, Math.PI * 2); ctx.stroke()
+            ctx.strokeStyle = root.darkMode || root.transparentSurface ? "rgba(255,255,255,0.72)" : "rgba(57,65,73,0.7)"
+            ctx.beginPath(); ctx.arc(center, center, radius, -Math.PI / 2,
+                                     -Math.PI / 2 + Math.PI * 2 * root.holdProgress); ctx.stroke()
+        }
+    }
+    onHoldProgressChanged: holdRing.requestPaint()
+    NumberAnimation { id: holdFill; target: root; property: "holdProgress"; from: 0; to: 1; duration: root.holdDuration }
+    Timer {
+        id: holdTimer
+        interval: root.holdDuration
+        onTriggered: if (tap.pressed && tap.containsMouse) { root.holdConsumed = true; root.longPressed() }
+    }
+
     IconGlyph {
         anchors.centerIn: parent
         width: root.glyphSize
@@ -97,5 +128,19 @@ Item {
 
     HoverHandler { id: hover }
     opacity: enabled ? 1 : .38
-    MouseArea { id: tap; anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.clicked(); onWheel: wheel => { root.wheelScrolled(wheel); wheel.accepted = true } }
+    MouseArea {
+        id: tap
+        anchors.fill: parent
+        hoverEnabled: root.holdEnabled
+        cursorShape: Qt.PointingHandCursor
+        onPressed: {
+            root.holdConsumed = false
+            if (root.holdEnabled) { root.holdProgress = 0; holdFill.start(); holdTimer.start() }
+        }
+        onReleased: { holdFill.stop(); holdTimer.stop(); root.holdProgress = 0 }
+        onCanceled: { holdFill.stop(); holdTimer.stop(); root.holdProgress = 0 }
+        onExited: if (pressed) { holdFill.stop(); holdTimer.stop(); root.holdProgress = 0 }
+        onClicked: if (!root.holdConsumed) root.clicked()
+        onWheel: wheel => { root.wheelScrolled(wheel); wheel.accepted = true }
+    }
 }

@@ -2,7 +2,7 @@
   #error StageDir is required
 #endif
 #ifndef ReleaseVersion
-  #define ReleaseVersion "0.3.6"
+  #define ReleaseVersion "0.3.7"
 #endif
 [Setup]
 AppId={{C9DFBE62-EA54-44D9-AE71-378F2715325D}

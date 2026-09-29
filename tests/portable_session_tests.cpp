@@ -944,6 +944,11 @@ private slots:
         }
         player.setPlaybackMode("shuffle"); player.setPlaybackMode("sequential");
         QCOMPARE(player.playbackMode(), QString("listLoop"));
+        player.setPlaybackMode("endless");
+        QCOMPARE(player.playbackMode(), QString("endless"));
+        QCOMPARE(db.getSetting("playback.defaultMode").value_or(""), std::string("Endless"));
+        player.cyclePlaybackMode();
+        QCOMPARE(player.playbackMode(), QString("listLoop"));
     }
     void throttledOnlineSeekKeepsGuiResponsive_data() {
         QTest::addColumn<bool>("flac");
@@ -2170,6 +2175,35 @@ private slots:
         QTest::addColumn<QString>("mode");QTest::addColumn<QString>("transition");
         for(const auto& transition:QStringList{"Normal","Gapless"})for(const auto& mode:QStringList{"singleLoop","listLoop","stopAfterCurrent"})
             QTest::newRow(qPrintable(transition+"-"+mode))<<mode<<transition;
+    }
+    void endlessModeAppendsLocalSongAtQueueEnd() {
+        infrastructure::database::Database db;
+        const auto path = temporary_.filePath("endless-mode.sqlite");
+        QVERIFY(db.open(path)); QVERIFY(db.migrate());
+        domain::Track localSong;
+        localSong.id = domain::TrackId("endless-local");
+        localSong.title = "Endless local";
+        localSong.localPath = mp3_.toStdString();
+        QVERIFY(db.upsertTrack(localSong));
+        infrastructure::database::SettingsRepository repo(db);
+        qmlbridge::SourceController source(&repo);
+        qmlbridge::PortableSession player(db, path, source);
+        QTRY_VERIFY_WITH_TIMEOUT(player.ready() && player.songs().size() == 1, 8000);
+        player.playAll({local(flac_)});
+        player.setPlaybackMode("endless");
+        QTRY_VERIFY_WITH_TIMEOUT(player.state() == "Playing" && player.duration() > 5000, 10000);
+        player.seek(player.duration() - 900);
+        QTRY_VERIFY_WITH_TIMEOUT(player.currentQueueIndex() == 1 && player.state() == "Playing", 9000);
+        QCOMPARE(player.queueSongs().size(), 2);
+        QCOMPARE(player.currentTrack().value("localPath").toString(), mp3_);
+        const auto firstEntry = player.currentTrack().value("entryId");
+        QTRY_VERIFY_WITH_TIMEOUT(player.duration() > 5000, 8000);
+        player.seek(player.duration() - 900);
+        QTRY_VERIFY_WITH_TIMEOUT(player.currentQueueIndex() == 2 && player.state() == "Playing", 9000);
+        QCOMPARE(player.queueSongs().size(), 3);
+        QCOMPARE(player.currentTrack().value("localPath").toString(), mp3_);
+        QVERIFY(player.currentTrack().value("entryId") != firstEntry);
+        player.stop();
     }
     void naturalQueueModes() {
         QFETCH(QString,mode);QFETCH(QString,transition);

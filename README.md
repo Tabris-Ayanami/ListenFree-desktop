@@ -31,13 +31,13 @@ Windows 10/11 x64 原生音乐播放器，使用 Qt Quick、Qmmp、QuickJS-ng �
 
 脚本通过 CMake 构建 Release，部署到 dist/ListenFree-Portable 并做隔离启动检查。重新部署保留该目录的个人 data。CMakePresets.json 提供当前工具链的 portable 预设，可用 CMakeUserPresets.json 覆盖本机路径。
 
-安装 Inno Setup 6 后生成 0.3.6 安装版：
+安装 Inno Setup 6 后生成 0.3.7 安装版：
 
 ```powershell
-./scripts/windows/package-release.ps1 -Version 0.3.6 -InstallerOnly
+./scripts/windows/package-release.ps1 -Version 0.3.7 -InstallerOnly
 ```
 
-省略 `-InstallerOnly` 并安装 7-Zip 时，脚本仍可生成便携 ZIP；0.3.6 的 GitHub Release 只发布安装包与更新清单。改动见 [更新说明](packaging/release-notes-0.3.6.txt)。
+省略 `-InstallerOnly` 并安装 7-Zip 时，脚本仍可生成便携 ZIP；0.3.7 的 GitHub Release 只发布安装包与更新清单。改动见 [更新说明](packaging/release-notes-0.3.7.txt)。
 
 使用已经验收的运行库目录可传入 `-RuntimeDirectory <目录>`；追加 `-SkipChecksums` 可只生成安装包和便携 ZIP，不生成校验文件。
 

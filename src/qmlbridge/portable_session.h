@@ -268,6 +268,8 @@ signals:
     void notice(const QString& message);
     void artworkChanged();
 private:
+    bool enqueueTrackInternal(const QVariantMap& track, bool next, bool allowDuplicate);
+    bool appendEndlessTrack();
     void scheduleReload(bool allowDelta);
     QVariantList metadataCandidates_;
     QPointer<QNetworkReply> metadataMatchReply_;

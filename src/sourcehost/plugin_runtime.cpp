@@ -64,9 +64,11 @@ public:
         std::function<void(const QString&, const QString&)> requestRejected;
         std::function<QString(const QString&, const QString&, const QString&)> requestStarted;
         std::function<void(const QString&)> requestAborted;
+        std::function<void(const QString&)> runtimeFailed;
     };
 
-    explicit QuickJsEngine(Callbacks callbacks) : callbacks_(std::move(callbacks)) {
+    explicit QuickJsEngine(QObject* timerOwner, Callbacks callbacks)
+        : callbacks_(std::move(callbacks)), timerOwner_(timerOwner) {
         runtime_ = JS_NewRuntime();
         if (!runtime_) return;
         JS_SetMemoryLimit(runtime_, 96U * 1024U * 1024U);
@@ -82,6 +84,7 @@ public:
     }
 
     ~QuickJsEngine() {
+        clearTimers();
         clearUnhandledRejections();
         if (context_) JS_FreeContext(context_);
         if (runtime_) JS_FreeRuntime(runtime_);
@@ -311,6 +314,83 @@ private:
         return JS_UNDEFINED;
     }
 
+    struct TimerEntry {
+        QTimer* timer{nullptr};
+        JSValue callback{JS_UNDEFINED};
+        std::vector<JSValue> arguments;
+    };
+
+    static JSValue setTimeout(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
+        auto* engine = self(context);
+        if (argc < 1 || !JS_IsFunction(context, argv[0]))
+            return JS_ThrowTypeError(context, "setTimeout requires a function");
+        if (engine->timers_.size() >= 64)
+            return JS_ThrowRangeError(context, "too many pending timers");
+        int32_t delay = 0;
+        if (argc > 1 && JS_ToInt32(context, &delay, argv[1]) < 0) return JS_EXCEPTION;
+        const int id = ++engine->nextTimerId_;
+        TimerEntry entry;
+        entry.timer = new QTimer(engine->timerOwner_);
+        entry.timer->setSingleShot(true);
+        entry.callback = JS_DupValue(context, argv[0]);
+        for (int index = 2; index < argc; ++index)
+            entry.arguments.push_back(JS_DupValue(context, argv[index]));
+        QObject::connect(entry.timer, &QTimer::timeout, engine->timerOwner_,
+                         [engine, id] { engine->fireTimer(id); });
+        engine->timers_.insert(id, std::move(entry));
+        engine->timers_[id].timer->start(qMax(0, delay));
+        return JS_NewInt32(context, id);
+    }
+
+    static JSValue clearTimeout(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
+        int32_t id = 0;
+        if (argc > 0 && JS_ToInt32(context, &id, argv[0]) < 0) return JS_EXCEPTION;
+        self(context)->removeTimer(id);
+        return JS_UNDEFINED;
+    }
+
+    void removeTimer(int id) {
+        if (!timers_.contains(id)) return;
+        TimerEntry entry = timers_.take(id);
+        entry.timer->stop();
+        entry.timer->deleteLater();
+        JS_FreeValue(context_, entry.callback);
+        for (auto& argument : entry.arguments) JS_FreeValue(context_, argument);
+    }
+
+    void clearTimers() {
+        for (auto it = timers_.begin(); it != timers_.end(); ++it) {
+            it->timer->stop();
+            delete it->timer;
+            JS_FreeValue(context_, it->callback);
+            for (auto& argument : it->arguments) JS_FreeValue(context_, argument);
+        }
+        timers_.clear();
+    }
+
+    void fireTimer(int id) {
+        if (!timers_.contains(id)) return;
+        TimerEntry entry = timers_.take(id);
+        entry.timer->deleteLater();
+        beginExecution();
+        JSValue result = JS_Call(context_, entry.callback, JS_UNDEFINED,
+                                 static_cast<int>(entry.arguments.size()), entry.arguments.data());
+        JS_FreeValue(context_, entry.callback);
+        for (auto& argument : entry.arguments) JS_FreeValue(context_, argument);
+        QString error;
+        if (JS_IsException(result)) {
+            error = takeException(context_);
+        } else {
+            pumpJobs(&error);
+        }
+        JS_FreeValue(context_, result);
+        endExecution();
+        if (!error.isEmpty()) {
+            const auto report = callbacks_.runtimeFailed;
+            QTimer::singleShot(0, timerOwner_, [report, error] { report(error); });
+        }
+    }
+
     static QString bufferFromStringValue(const QString& value, const QString& encoding) {
         if (encoding.compare(QStringLiteral("base64"), Qt::CaseInsensitive) == 0) {
             return QString::fromLatin1(QByteArray::fromBase64(value.toLatin1()).toBase64());
@@ -467,6 +547,8 @@ private:
         RejectRequest,
         StartRequest,
         AbortRequest,
+        SetTimeout,
+        ClearTimeout,
         BufferFromString,
         BufferToString,
         BufferConcat,
@@ -489,6 +571,8 @@ private:
             case RejectRequest: return rejectRequest(context, thisValue, argc, argv);
             case StartRequest: return startRequest(context, thisValue, argc, argv);
             case AbortRequest: return abortRequest(context, thisValue, argc, argv);
+            case SetTimeout: return setTimeout(context, thisValue, argc, argv);
+            case ClearTimeout: return clearTimeout(context, thisValue, argc, argv);
             case BufferFromString: return bufferFromString(context, thisValue, argc, argv);
             case BufferToString: return bufferToString(context, thisValue, argc, argv);
             case BufferConcat: return bufferConcat(context, thisValue, argc, argv);
@@ -699,6 +783,8 @@ private:
             {"rejectRequest", RejectRequest, 2},
             {"startRequest", StartRequest, 3},
             {"abortRequest", AbortRequest, 1},
+            {"setTimeout", SetTimeout, 2},
+            {"clearTimeout", ClearTimeout, 1},
             {"bufferFromString", BufferFromString, 2},
             {"bufferToString", BufferToString, 2},
             {"bufferConcat", BufferConcat, 1},
@@ -740,6 +826,9 @@ private:
     }
 
     Callbacks callbacks_;
+    QObject* timerOwner_{nullptr};
+    QHash<int, TimerEntry> timers_;
+    int nextTimerId_{0};
     struct UnhandledRejection {
         JSValue promise{JS_UNDEFINED};
         QString message;
@@ -765,6 +854,8 @@ const QString bootstrapScript = QStringLiteral(R"JS(
     // LX scripts routinely log from request callbacks. Logging must not turn a
     // recoverable network failure into a ReferenceError or leak signed URLs.
     root.console = { log() {}, info() {}, warn() {}, error() {}, debug() {}, trace() {}, time() {}, timeEnd() {}, clear() {} }
+    root.setTimeout = (callback, delay, ...args) => __lf_bridge.setTimeout(callback, delay, ...args)
+    root.clearTimeout = id => __lf_bridge.clearTimeout(id)
     const handlers = Object.create(null)
     const eventNames = { request: 'request', inited: 'inited', updateAlert: 'updateAlert' }
     let updateAlertSent = false
@@ -1430,7 +1521,8 @@ private:
             network_->setProxy(QNetworkProxy(QNetworkProxy::HttpProxy, host,
                                              static_cast<quint16>(port)));
         }
-        engine_ = std::make_unique<QuickJsEngine>(QuickJsEngine::Callbacks{
+        const auto generation = runtimeGeneration_;
+        engine_ = std::make_unique<QuickJsEngine>(&owner_, QuickJsEngine::Callbacks{
             [this](const QString& name, const QString& json) { handleEvent(name, json); },
             [this](const QString& id, const QString& json) { queueTerminal(id, json, true); },
             [this](const QString& id, const QString& message) { queueTerminal(id, message, false); },
@@ -1438,6 +1530,9 @@ private:
                 return startNetworkRequest(id, url, options);
             },
             [this](const QString& id) { abortNetworkRequest(id); },
+            [this, generation](const QString& error) {
+                if (generation == runtimeGeneration_) failRuntime(error);
+            },
         });
         if (!engine_->isValid()) {
             const QString runtimeError = engine_->initializationError();
@@ -1454,8 +1549,17 @@ private:
             respondError(request.requestId, QStringLiteral("plugin.bootstrap-failed"), scriptError);
             return;
         }
-        if (!engine_->setScriptInfo(parseScriptMetadata(*source), &scriptError) ||
-            !engine_->evaluate(QString::fromUtf8(*source), info.absoluteFilePath(), &scriptError)) {
+        if (!engine_->setScriptInfo(parseScriptMetadata(*source), &scriptError)) {
+            reset();
+            respondError(request.requestId, QStringLiteral("plugin.script-failed"), scriptError);
+            return;
+        }
+        const bool evaluated = engine_->evaluate(QString::fromUtf8(*source),
+                                                 info.absoluteFilePath(), &scriptError);
+        // LX marks a source ready when it sends `inited`. Its browser preload
+        // ignores script errors raised after that event, so a late exception
+        // must not discard an already registered request handler.
+        if (!evaluated && !initialized_) {
             reset();
             respondError(request.requestId, QStringLiteral("plugin.script-failed"), scriptError);
             return;

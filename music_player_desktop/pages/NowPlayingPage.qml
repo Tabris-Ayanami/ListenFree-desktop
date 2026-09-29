@@ -102,6 +102,7 @@ Item {
     property string playbackMode: "listLoop"
     property bool localTrack: false
     signal cycleModeRequested
+    signal endlessModeRequested
     signal equalizerRequested
     signal informationRequested
     signal downloadRequested
@@ -394,7 +395,7 @@ Item {
             y: page.overflowStyle ? parent.height - height - 38 : timeLabels.y + timeLabels.height + 20 * page.controlScale
             spacing: 10 * page.controlScale
             height: 64 * page.controlScale
-            RoundIconButton { objectName: "nowPlayingModeButton"; anchors.verticalCenter: parent.verticalCenter; diameter: 40 * page.controlScale; kind: AppTheme.playbackModeInfo(page.playbackMode).kind; tooltip: AppTheme.playbackModeInfo(page.playbackMode).label; glyphColor: "#f4f1f2"; transparentSurface: true; darkMode: page.darkMode; reducedMotion: page.reducedMotion; onClicked: page.cycleModeRequested() }
+            RoundIconButton { objectName: "nowPlayingModeButton"; anchors.verticalCenter: parent.verticalCenter; diameter: 40 * page.controlScale; kind: AppTheme.playbackModeInfo(page.playbackMode).kind; tooltip: page.playbackMode === "endless" ? qsTr("无尽模式（长按关闭）") : AppTheme.playbackModeInfo(page.playbackMode).label + qsTr("（长按开启无尽模式）"); holdEnabled: true; glyphColor: "#f4f1f2"; transparentSurface: true; darkMode: page.darkMode; reducedMotion: page.reducedMotion; onClicked: page.cycleModeRequested(); onLongPressed: page.endlessModeRequested() }
             RoundIconButton { objectName: "nowPlayingPreviousButton"; anchors.verticalCenter: parent.verticalCenter; diameter: 48 * page.controlScale; kind: "previous"; glyphColor: "#f8f8f8"; transparentSurface: true; darkMode: page.darkMode; reducedMotion: page.reducedMotion; onClicked: page.previousRequested() }
             RoundIconButton { objectName: "nowPlayingPlayPauseButton"; anchors.verticalCenter: parent.verticalCenter; diameter: 64 * page.controlScale; kind: page.playing ? "pause" : "play"; glyphColor: "#ffffff"; transparentSurface: true; darkMode: page.darkMode; reducedMotion: page.reducedMotion; onClicked: page.playPauseRequested() }
             RoundIconButton { objectName: "nowPlayingNextButton"; anchors.verticalCenter: parent.verticalCenter; diameter: 48 * page.controlScale; kind: "next"; glyphColor: "#f8f8f8"; transparentSurface: true; darkMode: page.darkMode; reducedMotion: page.reducedMotion; onClicked: page.nextRequested() }

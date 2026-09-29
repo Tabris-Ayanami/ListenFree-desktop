@@ -336,6 +336,7 @@ inline constexpr char settingsSchema[] = R"json({
       "LoopAll",
       "Shuffle",
       "LoopOne",
+      "Endless",
       "StopAfterCurrent"
     ]
   },

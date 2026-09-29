@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(ListenFree VERSION 0.3.6 LANGUAGES CXX)
+project(ListenFree VERSION 0.3.7 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -465,6 +465,7 @@ qt_add_qml_module(listenfree
         music_player_desktop/assets/icons/previous.svg
         music_player_desktop/assets/icons/queue.svg
         music_player_desktop/assets/icons/repeat.svg
+        music_player_desktop/assets/icons/infinity.svg
         music_player_desktop/assets/icons/repeatOne.svg
         music_player_desktop/assets/icons/search.svg
         music_player_desktop/assets/icons/sequential.svg

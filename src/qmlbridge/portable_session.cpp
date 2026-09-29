@@ -23,6 +23,7 @@
 #include <QJsonObject>
 #include <QNetworkReply>
 #include <QRegularExpression>
+#include <QRandomGenerator>
 #include <QTextDocumentFragment>
 #include <QTimer>
 #include <QThreadPool>
@@ -265,7 +266,9 @@ PortableSession::PortableSession(infrastructure::database::Database& database, c
             }
             prematureNetworkRetries_ = 0;
             if (mode_ == "stopAfterCurrent") { stop(); return; }
-            if (mode_ == "singleLoop") beginCurrent(); else if(navigation_.nextTrack()) next(); else stop();
+            if (mode_ == "singleLoop") { beginCurrent(); return; }
+            if (mode_ == "endless" && !navigation_.nextTrack()) appendEndlessTrack();
+            if (navigation_.nextTrack()) next(); else stop();
         });
     };
     player_.setEvents(std::move(events));
@@ -721,6 +724,7 @@ void PortableSession::next() {
         navigation_.setCurrent(pending);
         invalidate();
     }
+    if (mode_ == "endless" && !navigation_.nextTrack()) appendEndlessTrack();
     if (prepareSmartMix(navigation_.indexOf(navigation_.nextTrack()), true)) return;
     const int current=navigation_.currentIndex();int target=-1;
     {const QSignalBlocker blocker(&navigation_);if(navigation_.next())target=navigation_.currentIndex();navigation_.setCurrent(current);}
@@ -779,6 +783,9 @@ void PortableSession::toggleMute() {
     } else setVolume(lastAudibleVolume_);
 }
 bool PortableSession::enqueueTrack(const QVariantMap& value, bool next) {
+    return enqueueTrackInternal(value, next, false);
+}
+bool PortableSession::enqueueTrackInternal(const QVariantMap& value, bool next, bool allowDuplicate) {
     cancelSmartMix(); mixAttempted_=false;
     auto map = value;
     if (map.value("localPath").toString().isEmpty() && map.value("rid").toString().isEmpty() && map.value("remoteUrl").toString().isEmpty() && map.value("radioId").toString().isEmpty()) return false;
@@ -786,7 +793,7 @@ bool PortableSession::enqueueTrack(const QVariantMap& value, bool next) {
     // The three bulk paths start from an empty queue. Keep their duplicate
     // check linear while preserving the existing lookup for ordinary actions.
     if (batching_ && !next && batchSongKeys_.contains(key)) return true;
-    const int existing = batching_ && !next ? -1 : queueIndexFor(map);
+    const int existing = allowDuplicate || (batching_ && !next) ? -1 : queueIndexFor(map);
     if(existing>=0) {
         const int current=navigation_.currentIndex();
         if(next && existing!=current) moveQueue(existing,existing<current?current:current+1);
@@ -825,6 +832,21 @@ bool PortableSession::enqueueTrack(const QVariantMap& value, bool next) {
     } else syncQueue();
     if (firstEntry && !batching_) emit currentTrackChanged();
     return true;
+}
+bool PortableSession::appendEndlessTrack() {
+    if (songs_.isEmpty()) return false;
+    const int count = songs_.size();
+    const QString currentPath = currentTrack().value("localPath").toString();
+    const int start = QRandomGenerator::global()->bounded(count);
+    QVariantMap fallback;
+    for (int offset = 0; offset < count; ++offset) {
+        const auto candidate = songs_.at((start + offset) % count).toMap();
+        const QString path = candidate.value("localPath").toString();
+        if (path.isEmpty() || !QFileInfo(path).isFile()) continue;
+        if (path != currentPath) return enqueueTrackInternal(candidate, false, true);
+        if (fallback.isEmpty()) fallback = candidate;
+    }
+    return !fallback.isEmpty() && enqueueTrackInternal(fallback, false, true);
 }
 bool PortableSession::openTrack(const QVariantMap& value) {
     radioRetries_=0;
@@ -933,13 +955,13 @@ bool PortableSession::moveQueue(int from, int to) {
 void PortableSession::clearQueue() { mediaReady_=false;invalidate(); navigation_.clear(); entries_.clear(); lyrics_.clear(); syncQueue(); emit currentTrackChanged(); emit lyricsChanged(); emit changed(); }
 void PortableSession::playAll(const QVariantList& values) { clearQueue(); batchSongKeys_.clear(); batching_ = true; for (const auto& value : values) enqueueTrack(value.toMap()); batching_ = false; batchSongKeys_.clear(); syncQueue(); if (!navigation_.isEmpty()) selectQueue(0); }
 void PortableSession::setPlaybackMode(const QString& requested) {
-    const QString mode = (requested == "repeatAll" || requested == "LoopAll" || requested == "Sequential" || requested == "sequential") ? "listLoop" : (requested == "repeatOne" || requested == "LoopOne") ? "singleLoop" : requested == "Shuffle" ? "shuffle" : requested == "StopAfterCurrent" ? "stopAfterCurrent" : requested;
-    if (mode != "listLoop" && mode != "singleLoop" && mode != "shuffle" && mode != "stopAfterCurrent") return;
+    const QString mode = (requested == "repeatAll" || requested == "LoopAll" || requested == "Sequential" || requested == "sequential") ? "listLoop" : (requested == "repeatOne" || requested == "LoopOne") ? "singleLoop" : requested == "Shuffle" ? "shuffle" : requested == "StopAfterCurrent" ? "stopAfterCurrent" : requested == "Endless" ? "endless" : requested;
+    if (mode != "listLoop" && mode != "singleLoop" && mode != "shuffle" && mode != "stopAfterCurrent" && mode != "endless") return;
     if (requested == "Sequential" || requested == "sequential") database_.setSetting("playback.defaultMode","LoopAll");
     if (mode == mode_) return;
     cancelSmartMix(); mixAttempted_=false;
-    mode_ = mode; uiSettings_.setRepeatableList(mode != "stopAfterCurrent"); uiSettings_.setShuffle(mode == "shuffle");
-    database_.setSetting("playback.defaultMode",mode=="listLoop"?"LoopAll":mode=="singleLoop"?"LoopOne":mode=="shuffle"?"Shuffle":"StopAfterCurrent");
+    mode_ = mode; uiSettings_.setRepeatableList(mode != "stopAfterCurrent" && mode != "endless"); uiSettings_.setShuffle(mode == "shuffle");
+    database_.setSetting("playback.defaultMode",mode=="listLoop"?"LoopAll":mode=="singleLoop"?"LoopOne":mode=="shuffle"?"Shuffle":mode=="endless"?"Endless":"StopAfterCurrent");
     saveQueue(); emit queueChanged();
 }
 void PortableSession::syncQueue() {

@@ -44,6 +44,7 @@ QtObject {
         {mode: "listLoop", kind: "repeat", label: qsTr("列表循环")},
         {mode: "singleLoop", kind: "repeatOne", label: qsTr("单曲循环")},
         {mode: "shuffle", kind: "shuffle", label: qsTr("随机播放")},
+        {mode: "endless", kind: "infinity", label: qsTr("无尽模式")},
         {mode: "stopAfterCurrent", kind: "stop", label: qsTr("播完当前停止")}
     ]
     function playbackModeInfo(mode) { return playbackModes.find(item => item.mode === mode) || playbackModes[0] }

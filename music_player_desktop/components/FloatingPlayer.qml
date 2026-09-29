@@ -78,6 +78,7 @@ Item {
     signal volumeChangedByUser(real value)
     signal muteToggleRequested()
     signal cycleModeRequested()
+    signal endlessModeRequested()
 
     width: collapsed ? collapsedWidth : expandedWidth
     height: collapsed ? 62 : 80
@@ -254,10 +255,12 @@ Item {
             raisedSurface: true
             diameter: 34
             kind: AppTheme.playbackModeInfo(root.playbackMode).kind
-            tooltip: AppTheme.playbackModeInfo(root.playbackMode).label
+            tooltip: root.playbackMode === "endless" ? qsTr("无尽模式（长按关闭）") : AppTheme.playbackModeInfo(root.playbackMode).label + qsTr("（长按开启无尽模式）")
+            holdEnabled: true
             darkMode: root.darkMode
             reducedMotion: root.reducedMotion
             onClicked: root.cycleModeRequested()
+            onLongPressed: root.endlessModeRequested()
         }
 
         RoundIconButton {

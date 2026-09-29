@@ -1,9 +1,10 @@
 [CmdletBinding()]
 param(
     [string]$SourceRoot='',
-    [string]$Version='0.3.6',
+    [string]$Version='0.3.7',
     [string]$OutputDirectory='',
     [string]$RuntimeDirectory='',
+    [string]$VendorRoot='',
     [string]$InnoCompiler='C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
     [string]$SevenZip='C:\Program Files\7-Zip\7z.exe',
     [string]$SigningKeyFile=(Join-Path $env:LOCALAPPDATA 'ListenFree\ReleaseSigning\winsparkle-private.key'),
@@ -17,6 +18,7 @@ Set-StrictMode -Version Latest
 if (!$SourceRoot) { $SourceRoot=(Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path }
 if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$') { throw 'Invalid release version' }
 $source=[IO.Path]::GetFullPath($SourceRoot)
+$vendor=if($VendorRoot){[IO.Path]::GetFullPath($VendorRoot)}else{[IO.Path]::GetFullPath((Join-Path $source '..\_vendor'))}
 $runtime=if($RuntimeDirectory){[IO.Path]::GetFullPath($RuntimeDirectory)}else{Join-Path $source 'dist\ListenFree-Portable'}
 if (!(Test-Path -LiteralPath (Join-Path $runtime 'qt.conf'))) { throw "Missing deployed runtime: $runtime" }
 $releaseRoot=if($OutputDirectory){[IO.Path]::GetFullPath($OutputDirectory)}else{Join-Path $source "dist\releases\$Version"}
@@ -40,13 +42,13 @@ foreach ($name in 'generic','iconengines','imageformats','multimedia','networkin
 foreach ($name in 'listenfree.exe','listenfree-sourcehost.exe','WinSparkle.dll') {
     Copy-Item -LiteralPath (Join-Path $source "build\portable\$name") -Destination $stage
 }
-Copy-Item -LiteralPath (Join-Path $source '..\_vendor\qmmp-build-qt\src\plugins\Transports\http\http.dll') -Destination (Join-Path $stage 'qmmp\Transports\http.dll') -Force
+Copy-Item -LiteralPath (Join-Path $vendor 'qmmp-build-qt\src\plugins\Transports\http\http.dll') -Destination (Join-Path $stage 'qmmp\Transports\http.dll') -Force
 # The tested runtime carries patched Qt/Qmmp DLLs; do not replace them with SDK originals.
 Copy-Item -LiteralPath (Join-Path $runtime 'qt.conf') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $runtime 'licenses') -Destination $stage -Recurse
 Copy-Item -Path (Join-Path $source 'licenses\*.txt') -Destination (Join-Path $stage 'licenses') -Force
-foreach ($pair in @(@('.vcpkg_installed\x64-mingw-dynamic\share','qjs'),@('.vcpkg_installed\x64-mingw-dynamic\share','taglib'),@('.vcpkg_installed\x64-mingw-dynamic\share','zlib'),@('.vcpkg_installed\x64-mingw-dynamic\share','utf8cpp'),@('..\_vendor\qmmp-vcpkg-installed-qt\x64-mingw-dynamic\share','ffmpeg'),@('..\_vendor\qmmp-vcpkg-installed-qt\x64-mingw-dynamic\share','curl'))) {
-    $copyright=Join-Path $source ($pair[0]+'\'+$pair[1]+'\copyright')
+foreach ($pair in @(@((Join-Path $source '.vcpkg_installed\x64-mingw-dynamic\share'),'qjs'),@((Join-Path $source '.vcpkg_installed\x64-mingw-dynamic\share'),'taglib'),@((Join-Path $source '.vcpkg_installed\x64-mingw-dynamic\share'),'zlib'),@((Join-Path $source '.vcpkg_installed\x64-mingw-dynamic\share'),'utf8cpp'),@((Join-Path $vendor 'qmmp-vcpkg-installed-qt\x64-mingw-dynamic\share'),'ffmpeg'),@((Join-Path $vendor 'qmmp-vcpkg-installed-qt\x64-mingw-dynamic\share'),'curl'))) {
+    $copyright=Join-Path $pair[0] ($pair[1]+'\copyright')
     if (Test-Path -LiteralPath $copyright) { Copy-Item -LiteralPath $copyright -Destination (Join-Path $stage ('licenses\'+$pair[1]+'-copyright.txt')) }
 }
 Copy-Item -LiteralPath (Join-Path $source 'licenses\THIRD-PARTY-NOTICES.txt') -Destination (Join-Path $stage 'licenses\THIRD-PARTY-NOTICES.txt') -Force
@@ -65,7 +67,7 @@ $smokeData=Join-Path $source "build\release-smoke-$Version"
 if (!$PortableOnly) {
     & $InnoCompiler "/DStageDir=$stage" "/DOutputDir=$releaseRoot" "/DReleaseVersion=$Version" (Join-Path $PSScriptRoot 'listenfree.iss')
     if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed' }
-    & (Join-Path $PSScriptRoot 'new-update-appcast.ps1') -Installer (Join-Path $releaseRoot "ListenFree-$Version-windows-x64-Setup.exe") -Version $Version -SigningKeyFile $SigningKeyFile -ReleaseNotes $releaseNotes
+    & (Join-Path $PSScriptRoot 'new-update-appcast.ps1') -Installer (Join-Path $releaseRoot "ListenFree-$Version-windows-x64-Setup.exe") -Version $Version -SigningKeyFile $SigningKeyFile -WinSparkleTool (Join-Path $vendor 'winsparkle-0.9.4\WinSparkle-0.9.4\bin\winsparkle-tool.exe') -ReleaseNotes $releaseNotes
 }
 if (!$InstallerOnly) {
 $zip=Join-Path $releaseRoot "ListenFree-$Version-windows-x64-Portable.zip"
