@@ -37,7 +37,7 @@ Windows 10/11 x64 原生音乐播放器，使用 Qt Quick、Qmmp、QuickJS-ng �
 ./scripts/windows/package-release.ps1 -Version 0.3.8 -InstallerOnly -SkipChecksums
 ```
 
-省略 `-InstallerOnly` 并安装 7-Zip 时，脚本仍可生成便携 ZIP；0.3.8 的 GitHub Release 仅发布安装包。改动见 [更新说明](packaging/release-notes-0.3.8.txt)。
+省略 `-InstallerOnly` 并安装 7-Zip 时，脚本仍可生成便携 ZIP；0.3.8 的 GitHub Release 提供一个安装程序和应用内更新必需的签名清单。改动见 [更新说明](packaging/release-notes-0.3.8.txt)。
 
 使用已经验收的运行库目录可传入 `-RuntimeDirectory <目录>`；追加 `-SkipChecksums` 可只生成安装包和便携 ZIP，不生成校验文件。
 
@@ -66,7 +66,7 @@ CMake 从官方 Release 获取已固定 SHA-256 的 WinSparkle x64 包，也可�
 
 发布时把 Setup.exe 和 appcast.xml 上传同一个 GitHub Release，全部校验完成后再标记为最新正式版。预发布不要设为 latest；无需额外上传 SHA 文件。可单独调用 `scripts/windows/new-update-appcast.ps1` 对安装包签名并生成更新信息。
 
-0.3.8 按本次发行要求只上传 Setup.exe，未上传 appcast.xml，因此请从 Release 页面手动下载升级。本地打包仍生成并验证签名的更新清单，用于内部核验。
+0.3.8 初次发布遗漏 appcast.xml，已于 2026-10-07 补齐并验证线上更新地址返回 HTTP 200。安装程序未改变。`-InstallerOnly` 表示只生成安装程序分发形式；appcast.xml 是应用内更新接口的必需元数据，必须随安装包发布。发布验收还须从 `releases/latest/download/appcast.xml` 实际下载清单，核对版本、安装包地址、大小与签名，不能只检查安装包资产。
 
 ## 自定义音源兼容验证
 
