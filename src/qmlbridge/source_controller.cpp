@@ -1,6 +1,7 @@
 #include "qmlbridge/source_controller.h"
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -105,6 +106,11 @@ QString safeBaseName(const QFileInfo &info) {
   name.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_\\-.\\x{4e00}-\\x{9fff}]")),
                QStringLiteral("_"));
   return name.left(96);
+}
+
+QString importStorageName(const QFileInfo& info, const QString& identity) {
+  return safeBaseName(info) + QStringLiteral("-") + QString::fromLatin1(
+      QCryptographicHash::hash(identity.toUtf8(), QCryptographicHash::Sha256).toHex().left(16));
 }
 
 bool hasString(const QVariant &value, const QString &needle) {
@@ -312,7 +318,8 @@ bool SourceController::importLocalFile(const QString &path) {
     setError(QStringLiteral("无法创建音源目录"));
     return false;
   }
-  const auto name = safeBaseName(info);
+  const auto displayName = safeBaseName(info);
+  const auto name = importStorageName(info, info.canonicalFilePath());
   const auto target = QDir(sourceDirectory()).filePath(name +
                                                        QStringLiteral(".") +
                                                        extension);
@@ -326,7 +333,7 @@ bool SourceController::importLocalFile(const QString &path) {
   }
   const auto id = QStringLiteral("custom.") + name;
   QVariantMap map{{QStringLiteral("id"), id},
-                  {QStringLiteral("name"), name},
+                  {QStringLiteral("name"), displayName},
                   {QStringLiteral("kind"), QStringLiteral("custom")},
                   {QStringLiteral("description"), QStringLiteral("本地 JavaScript 音源")},
                   {QStringLiteral("version"), QStringLiteral("本地文件")},
@@ -367,6 +374,7 @@ bool SourceController::importUrl(const QUrl &url) {
   QNetworkRequest request(url);
   request.setTransferTimeout(15000);
   auto *reply = network_.get(request);
+  reply->setProperty("sourceImportUrl", url);
   connect(reply, &QIODevice::readyRead, reply, [reply] { if (reply->bytesAvailable() > kMaxPluginBytes) reply->abort(); });
   connect(reply, &QNetworkReply::finished, this,
           &SourceController::finishUrlImport);
@@ -380,7 +388,7 @@ void SourceController::finishUrlImport() {
   if (!reply)
     return;
   const auto data = reply->readAll();
-  const auto url = reply->url();
+  const auto url = reply->property("sourceImportUrl").toUrl();
   const auto networkError = reply->error();
   reply->deleteLater();
   if (networkError != QNetworkReply::NoError || data.isEmpty() ||
@@ -396,15 +404,15 @@ void SourceController::finishUrlImport() {
   if (name.isEmpty())
     name = QStringLiteral("remote-source");
   name = safeBaseName(QFileInfo(name + QStringLiteral(".js")));
-  const auto target = QDir(sourceDirectory()).filePath(name +
+  const auto storageName = importStorageName(QFileInfo(name + QStringLiteral(".js")), url.toString(QUrl::FullyEncoded));
+  const auto target = QDir(sourceDirectory()).filePath(storageName +
                                                        QStringLiteral(".js"));
-  QFile file(target);
-  if (!file.open(QIODevice::WriteOnly) || file.write(data) != data.size()) {
+  QSaveFile file(target);
+  if (!file.open(QIODevice::WriteOnly) || file.write(data) != data.size() || !file.commit()) {
     setError(QStringLiteral("无法保存远程音源"));
     return;
   }
-  file.close();
-  const auto id = QStringLiteral("custom.") + name;
+  const auto id = QStringLiteral("custom.") + storageName;
   QVariantMap map{{QStringLiteral("id"), id},
                   {QStringLiteral("name"), name},
                   {QStringLiteral("kind"), QStringLiteral("custom")},
@@ -541,7 +549,7 @@ void SourceController::loadActivePlugin() {
                            {QStringLiteral("hostReady"), false}});
   setStatus(QStringLiteral("正在验证音源脚本…"));
   setError({});
-  if (!host_->request(request, 35000)) {
+  if (!host_->request(request, sourcehost::PluginClientTimeoutMs)) {
     const auto failedId = pendingLoadSourceId_;
     pendingLoadId_.clear();
     pendingLoadSourceId_.clear();
@@ -566,6 +574,15 @@ void SourceController::handleHostMessage(
   if (message.type != sourcehost::MessageType::Result &&
       message.type != sourcehost::MessageType::Error)
     return;
+
+  const auto code = message.payload.value(QStringLiteral("code")).toString();
+  if (message.type == sourcehost::MessageType::Error &&
+      (code == QStringLiteral("plugin.runtime-failed") || code == QStringLiteral("plugin.not-loaded"))) {
+    hostSourceInfo_.clear();
+    updateSource(activeId_, {{QStringLiteral("status"), QStringLiteral("音源运行失败，请重新连接")},
+                            {QStringLiteral("hostReady"), false}});
+    setError(errorMessage(message.payload));
+  }
 
   if (!pendingLoadId_.isEmpty() && message.requestId == pendingLoadId_) {
     const auto sourceId = pendingLoadSourceId_;
@@ -666,6 +683,10 @@ void SourceController::handleHostMessage(
 void SourceController::handleHostTerminal(
     const QString &requestId,
     sourcehost::SourceHostClient::RequestTerminal terminal) {
+  // Remote responses carry the specific plugin failure. The terminal signal
+  // arrives before messageReceived, so consuming it here discards that reason.
+  if (terminal == sourcehost::SourceHostClient::RequestTerminal::RemoteError ||
+      terminal == sourcehost::SourceHostClient::RequestTerminal::Succeeded) return;
   if (requestId == pendingLoadId_ && terminal !=
                                             sourcehost::SourceHostClient::RequestTerminal::Succeeded) {
     const auto sourceId = pendingLoadSourceId_;
@@ -824,6 +845,10 @@ QString SourceController::resolve(const QString &sourceId,
     setError(QStringLiteral("当前音源不支持 %1").arg(action));
     return {};
   }
+  if (!pendingLoadId_.isEmpty() || hostSourceInfo_.isEmpty()) {
+    setError(QStringLiteral("音源正在初始化，请稍后重试播放"));
+    return {};
+  }
   const auto info = hostSourceInfo_.value(provider);
   if (normalizedSource != activeId_ || !hasString(info.value("actions"), action)) {
     setError(QStringLiteral("当前音源不支持此平台的请求"));return {};
@@ -849,7 +874,7 @@ QString SourceController::resolve(const QString &sourceId,
                          QJsonObject::fromVariantMap(musicInfo));
   pendingResolutions_.insert(request.requestId,
                              {normalizedSource, action, selectedQuality});
-  if (!host_->request(request, 15000)) {
+  if (!host_->request(request, sourcehost::PluginClientTimeoutMs)) {
     pendingResolutions_.remove(request.requestId);
     setError(QStringLiteral("无法向音源宿主发送请求"));
     return {};

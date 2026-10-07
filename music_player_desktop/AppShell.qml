@@ -767,15 +767,21 @@ Item {
             id: libraryBackdrop
             objectName: "libraryBackdrop"
             anchors.fill: parent
-        GlobalBackground {
-            id: globalBackground
-            visible: !shell.artworkCanvasActive
-            layer.enabled: shell.desktopTransparencyActive
+        Item {
+            id: desktopBackground
+            objectName: "desktopBackground"
+            anchors.fill: parent
+            // Compose the glass sample and tint before applying desktop alpha.
+            // Otherwise the glass re-samples an opaque source over the alpha layer.
+            layer.enabled: shell.desktopTransparencyActive && !shell.artworkCanvasActive
             layer.effect: ShaderEffect {
                 property var source
                 property real sidebarFraction: shell.sidebarWidth / Math.max(1,shell.width)
                 fragmentShader: "qrc:/shaders/window-transparency.frag.qsb"
             }
+        GlobalBackground {
+            id: globalBackground
+            visible: !shell.artworkCanvasActive
             objectName: "globalBackground"
             anchors.fill: parent
             artwork: shell.backgroundArtwork
@@ -839,6 +845,7 @@ Item {
             // the native window is allowed to reveal the desktop behind it.
             color: shell.mosaicCanvasActive ? (shell.darkMode ? "#b5101620" : "#9a202936") : shell.artistCanvasActive ? "transparent" : AppTheme.sidebarSurface
             Behavior on width { enabled: shell.captureView.length === 0; NumberAnimation { duration: AppTheme.duration(220); easing.type: Easing.InOutCubic } }
+        }
         }
 
         Column {

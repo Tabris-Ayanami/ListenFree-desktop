@@ -42,6 +42,10 @@ private:
   QMediaDevices devices_;
   QTimer status_;
   QTimer mediaUpdate_;
+  QTimer windowShapeUpdate_;
+  void* shapedWindow_{nullptr};
+  QSize shapedSize_;
+  int shapedRadius_{-1};
   WindowsMediaSession* mediaSession_{};
   std::unique_ptr<UpdateService> updater_;
   bool transparencyActive_{false};
@@ -51,6 +55,8 @@ private:
   void apply(const QString &key, const QVariant &value);
   void applyTheme();
   void applyTransparency();
+  Q_SLOT void scheduleWindowShape();
+  void applyWindowShape();
   void updateTray();
   void updateStatus();
   void updateMediaSession();

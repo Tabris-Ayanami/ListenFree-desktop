@@ -39,6 +39,10 @@
 #include <utility>
 #include <vector>
 
+static void initializeBrowserResources() {
+    Q_INIT_RESOURCE(sourcehost_browser);
+}
+
 namespace listenfree::sourcehost {
 
 namespace {
@@ -46,6 +50,7 @@ namespace {
 constexpr qsizetype MaxPluginBytes = 1024 * 1024;
 constexpr qsizetype MaxPendingPluginRequests = 256;
 constexpr qsizetype MaxUrlBytes = 2048;
+constexpr qsizetype MaxNetworkUrlBytes = 64 * 1024;
 constexpr qsizetype MaxPendingNetworkRequests = 64;
 constexpr qsizetype MaxNetworkRequestBytes = 8 * 1024 * 1024;
 constexpr qsizetype MaxNetworkResponseBytes = 8 * 1024 * 1024;
@@ -64,7 +69,8 @@ public:
         std::function<void(const QString&, const QString&)> requestRejected;
         std::function<QString(const QString&, const QString&, const QString&)> requestStarted;
         std::function<void(const QString&)> requestAborted;
-        std::function<void(const QString&)> runtimeFailed;
+        std::function<void(const QString&)> timerStarted;
+        std::function<void(const QString&, const QString&, bool)> timerFinished;
     };
 
     explicit QuickJsEngine(QObject* timerOwner, Callbacks callbacks)
@@ -95,6 +101,16 @@ public:
 
     bool isValid() const { return valid_; }
     QString initializationError() const { return initializationError_; }
+    bool hasPendingTasks() const { return !timers_.isEmpty(); }
+    void setRequestContext(const QString& id) { requestContext_ = id; }
+    void markInitialized() { scriptInitialized_ = true; }
+    bool failureIsFatal() const { return executionInterrupted_ || jobLimitExceeded_ ||
+        rejectionLimitExceeded_ || rejectionTrackerFailed_; }
+    void cancelRequestTimers(const QString& id) {
+        const auto ids = timers_.keys();
+        for (const auto timerId : ids)
+            if (timers_.value(timerId).requestId == id) removeTimer(timerId);
+    }
 
     bool evaluate(const QString& script, const QString& filename, QString* error) {
         if (!context_) {
@@ -106,16 +122,7 @@ public:
         beginExecution();
         JSValue result = JS_Eval(context_, source.constData(), static_cast<size_t>(source.size()),
                                  sourceName.constData(), JS_EVAL_TYPE_GLOBAL);
-        if (JS_IsException(result)) {
-            JS_FreeValue(context_, result);
-            if (error) *error = takeException(context_);
-            endExecution();
-            return false;
-        }
-        JS_FreeValue(context_, result);
-        const bool succeeded = pumpJobs(error);
-        endExecution();
-        return succeeded;
+        return finishExecution(result, nullptr, error);
     }
 
     bool setScriptInfo(const QJsonObject& metadata, QString* error) {
@@ -318,6 +325,7 @@ private:
         QTimer* timer{nullptr};
         JSValue callback{JS_UNDEFINED};
         std::vector<JSValue> arguments;
+        QString requestId;
     };
 
     static JSValue setTimeout(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
@@ -333,6 +341,7 @@ private:
         entry.timer = new QTimer(engine->timerOwner_);
         entry.timer->setSingleShot(true);
         entry.callback = JS_DupValue(context, argv[0]);
+        entry.requestId = engine->requestContext_;
         for (int index = 2; index < argc; ++index)
             entry.arguments.push_back(JS_DupValue(context, argv[index]));
         QObject::connect(entry.timer, &QTimer::timeout, engine->timerOwner_,
@@ -372,94 +381,32 @@ private:
         if (!timers_.contains(id)) return;
         TimerEntry entry = timers_.take(id);
         entry.timer->deleteLater();
+        const auto previousContext = requestContext_;
+        requestContext_ = entry.requestId;
+        callbacks_.timerStarted(entry.requestId);
         beginExecution();
         JSValue result = JS_Call(context_, entry.callback, JS_UNDEFINED,
                                  static_cast<int>(entry.arguments.size()), entry.arguments.data());
         JS_FreeValue(context_, entry.callback);
         for (auto& argument : entry.arguments) JS_FreeValue(context_, argument);
         QString error;
-        if (JS_IsException(result)) {
-            error = takeException(context_);
-        } else {
-            pumpJobs(&error);
-        }
-        JS_FreeValue(context_, result);
-        endExecution();
-        if (!error.isEmpty()) {
-            const auto report = callbacks_.runtimeFailed;
-            QTimer::singleShot(0, timerOwner_, [report, error] { report(error); });
-        }
-    }
-
-    static QString bufferFromStringValue(const QString& value, const QString& encoding) {
-        if (encoding.compare(QStringLiteral("base64"), Qt::CaseInsensitive) == 0) {
-            return QString::fromLatin1(QByteArray::fromBase64(value.toLatin1()).toBase64());
-        }
-        if (encoding.compare(QStringLiteral("hex"), Qt::CaseInsensitive) == 0) {
-            return QString::fromLatin1(QByteArray::fromHex(value.toLatin1()).toBase64());
-        }
-        if (encoding.compare(QStringLiteral("binary"), Qt::CaseInsensitive) == 0 ||
-            encoding.compare(QStringLiteral("latin1"), Qt::CaseInsensitive) == 0) {
-            return QString::fromLatin1(value.toLatin1().toBase64());
-        }
-        return QString::fromLatin1(value.toUtf8().toBase64());
-    }
-
-    static QString bufferToStringValue(const QString& base64, const QString& encoding) {
-        const QByteArray bytes = QByteArray::fromBase64(base64.toLatin1());
-        if (encoding.compare(QStringLiteral("base64"), Qt::CaseInsensitive) == 0) {
-            return QString::fromLatin1(bytes.toBase64());
-        }
-        if (encoding.compare(QStringLiteral("hex"), Qt::CaseInsensitive) == 0) {
-            return QString::fromLatin1(bytes.toHex());
-        }
-        return QString::fromUtf8(bytes);
-    }
-
-    static JSValue bufferFromString(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
-        QString values[2];
-        if (!strings(context, argc, argv, 2, values)) return JS_EXCEPTION;
-        return fromQString(context, bufferFromStringValue(values[0], values[1]));
-    }
-
-    static JSValue bufferToString(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
-        QString values[2];
-        if (!strings(context, argc, argv, 2, values)) return JS_EXCEPTION;
-        return fromQString(context, bufferToStringValue(values[0], values[1]));
-    }
-
-    static JSValue bufferConcat(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
-        if (argc < 1 || !JS_IsArray(argv[0])) return JS_ThrowTypeError(context, "expected string array");
-        int64_t length = 0;
-        if (JS_GetLength(context, argv[0], &length) < 0 || length < 0 || length > 65536) {
-            return JS_ThrowTypeError(context, "invalid buffer array length");
-        }
-        QByteArray result;
-        for (int64_t index = 0; index < length; ++index) {
-            JSValue item = JS_GetPropertyInt64(context, argv[0], index);
-            bool ok = false;
-            const QString encoded = toQString(context, item, &ok);
-            JS_FreeValue(context, item);
-            if (!ok) return JS_EXCEPTION;
-            result.append(QByteArray::fromBase64(encoded.toLatin1()));
-            if (result.size() > MaxPluginBytes) {
-                return JS_ThrowTypeError(context, "combined buffer exceeds the 1 MiB limit");
-            }
-        }
-        return fromQString(context, QString::fromLatin1(result.toBase64()));
-    }
-
-    static JSValue bufferLength(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
-        QString value;
-        if (!strings(context, argc, argv, 1, &value)) return JS_EXCEPTION;
-        return JS_NewInt64(context, QByteArray::fromBase64(value.toLatin1()).size());
+        finishExecution(result, nullptr, &error);
+        const bool fatal = failureIsFatal();
+        requestContext_ = previousContext;
+        callbacks_.timerStarted(previousContext);
+        // Defer terminal delivery until JS_Call has released all engine values.
+        // The callback may unload this engine; no engine pointer crosses turns.
+        const auto report = callbacks_.timerFinished;
+        QTimer::singleShot(0, timerOwner_, [report, requestId = entry.requestId, error, fatal] {
+            report(requestId, error, fatal);
+        });
     }
 
     static JSValue md5(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
         QString value;
         if (!strings(context, argc, argv, 1, &value)) return JS_EXCEPTION;
         return fromQString(context, QString::fromLatin1(
-                                        QCryptographicHash::hash(value.toUtf8(), QCryptographicHash::Md5).toHex()));
+                                        QCryptographicHash::hash(QByteArray::fromBase64(value.toLatin1()), QCryptographicHash::Md5).toHex()));
     }
 
     static JSValue aesEncrypt(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
@@ -489,20 +436,12 @@ private:
     static JSValue randomBytes(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
         int64_t size = -1;
         if (argc < 1 || JS_ToInt64(context, &size, argv[0]) < 0) return JS_EXCEPTION;
-        if (size < 0 || size > 1024 * 1024) return fromQString(context, {});
+        if (size < 0 || size > 1024 * 1024) return JS_ThrowRangeError(context, "invalid random byte count");
         QByteArray bytes(static_cast<qsizetype>(size), Qt::Uninitialized);
         for (qsizetype i = 0; i < bytes.size(); ++i) {
-            bytes[i] = static_cast<char>(QRandomGenerator::global()->generate() & 0xffU);
+            bytes[i] = static_cast<char>(QRandomGenerator::system()->generate() & 0xffU);
         }
         return fromQString(context, QString::fromLatin1(bytes.toBase64()));
-    }
-
-    static JSValue zeroBytes(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
-        int64_t size = -1;
-        if (argc < 1 || JS_ToInt64(context, &size, argv[0]) < 0) return JS_EXCEPTION;
-        if (size < 0 || size > 1024 * 1024) return fromQString(context, {});
-        return fromQString(context, QString::fromLatin1(
-                                        QByteArray(static_cast<qsizetype>(size), '\0').toBase64()));
     }
 
     static JSValue deflate(JSContext* context, JSValueConst, int argc, JSValueConst* argv) {
@@ -514,7 +453,7 @@ private:
         if (::compress2(reinterpret_cast<Bytef*>(output.data()), &outputSize,
                         reinterpret_cast<const Bytef*>(input.constData()),
                         static_cast<uLong>(input.size()), Z_DEFAULT_COMPRESSION) != Z_OK) {
-            return fromQString(context, {});
+            return JS_ThrowTypeError(context, "deflate failed");
         }
         output.resize(static_cast<qsizetype>(outputSize));
         return fromQString(context, QString::fromLatin1(output.toBase64()));
@@ -538,7 +477,7 @@ private:
             if (result != Z_BUF_ERROR || outputSize == static_cast<uLong>(MaxPluginBytes)) break;
             outputSize = qMin(static_cast<uLong>(MaxPluginBytes), outputSize * 2U);
         }
-        return fromQString(context, {});
+        return JS_ThrowTypeError(context, "inflate failed or output exceeds the limit");
     }
 
     enum BridgeFunction {
@@ -549,15 +488,10 @@ private:
         AbortRequest,
         SetTimeout,
         ClearTimeout,
-        BufferFromString,
-        BufferToString,
-        BufferConcat,
-        BufferLength,
         Md5,
         AesEncrypt,
         RsaEncrypt,
         RandomBytes,
-        ZeroBytes,
         Deflate,
         Inflate,
     };
@@ -573,15 +507,10 @@ private:
             case AbortRequest: return abortRequest(context, thisValue, argc, argv);
             case SetTimeout: return setTimeout(context, thisValue, argc, argv);
             case ClearTimeout: return clearTimeout(context, thisValue, argc, argv);
-            case BufferFromString: return bufferFromString(context, thisValue, argc, argv);
-            case BufferToString: return bufferToString(context, thisValue, argc, argv);
-            case BufferConcat: return bufferConcat(context, thisValue, argc, argv);
-            case BufferLength: return bufferLength(context, thisValue, argc, argv);
             case Md5: return md5(context, thisValue, argc, argv);
             case AesEncrypt: return aesEncrypt(context, thisValue, argc, argv);
             case RsaEncrypt: return rsaEncrypt(context, thisValue, argc, argv);
             case RandomBytes: return randomBytes(context, thisValue, argc, argv);
-            case ZeroBytes: return zeroBytes(context, thisValue, argc, argv);
             case Deflate: return deflate(context, thisValue, argc, argv);
             case Inflate: return inflate(context, thisValue, argc, argv);
             default: return JS_ThrowInternalError(context, "unknown native bridge function");
@@ -594,8 +523,10 @@ private:
     }
 
     static int interrupt(JSRuntime*, void* opaque) {
-        const auto* engine = static_cast<const QuickJsEngine*>(opaque);
-        return engine->executionActive_ && std::chrono::steady_clock::now() >= engine->deadline_;
+        auto* engine = static_cast<QuickJsEngine*>(opaque);
+        if (!engine->executionActive_ || std::chrono::steady_clock::now() < engine->deadline_) return 0;
+        engine->executionInterrupted_ = true;
+        return 1;
     }
 
     static void promiseRejectionTracker(JSContext* context, JSValueConst promise,
@@ -664,6 +595,8 @@ private:
     void beginExecution() {
         if (executionDepth_++ == 0) {
             executionActive_ = true;
+            executionInterrupted_ = false;
+            jobLimitExceeded_ = false;
             deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
         }
     }
@@ -683,6 +616,12 @@ private:
                 return false;
             }
             if (unhandledRejections_.isEmpty()) return true;
+            // Match LX preload onError: update checks and other background
+            // rejections after `inited` do not invalidate a registered source.
+            if (scriptInitialized_) {
+                clearUnhandledRejections();
+                return true;
+            }
             if (error) {
                 *error = QStringLiteral("Unhandled Promise rejection: %1")
                              .arg(unhandledRejections_.constBegin()->message);
@@ -699,6 +638,7 @@ private:
             }
         }
         if (JS_IsJobPending(runtime_)) {
+            jobLimitExceeded_ = true;
             if (error) *error = QStringLiteral("JavaScript Promise job limit exceeded.");
             return false;
         }
@@ -748,26 +688,27 @@ private:
         for (auto& value : values) JS_FreeValue(context_, value);
         JS_FreeValue(context_, function);
         JS_FreeValue(context_, global);
+        return finishExecution(result, booleanResult, error);
+    }
+
+    bool finishExecution(JSValue result, bool* booleanResult, QString* error) {
+        QString scriptError;
         if (JS_IsException(result)) {
-            JS_FreeValue(context_, result);
-            if (error) *error = takeException(context_);
-            endExecution();
-            return false;
-        }
-        if (booleanResult) {
+            scriptError = takeException(context_);
+        } else if (booleanResult) {
             const int converted = JS_ToBool(context_, result);
-            if (converted < 0) {
-                JS_FreeValue(context_, result);
-                if (error) *error = takeException(context_);
-                endExecution();
-                return false;
-            }
-            *booleanResult = converted != 0;
+            if (converted < 0) scriptError = takeException(context_);
+            else *booleanResult = converted != 0;
         }
         JS_FreeValue(context_, result);
-        const bool succeeded = pumpJobs(error);
+        // A callback may settle a request and then throw. Browser event loops
+        // still run its microtasks; otherwise that completed request hangs.
+        // Fatal resource exhaustion must never get another execution budget.
+        QString jobError;
+        const bool jobsSucceeded = !failureIsFatal() && pumpJobs(&jobError);
+        if (error) *error = jobError.isEmpty() ? scriptError : jobError;
         endExecution();
-        return succeeded;
+        return scriptError.isEmpty() && jobsSucceeded;
     }
 
     bool installBridge() {
@@ -785,15 +726,10 @@ private:
             {"abortRequest", AbortRequest, 1},
             {"setTimeout", SetTimeout, 2},
             {"clearTimeout", ClearTimeout, 1},
-            {"bufferFromString", BufferFromString, 2},
-            {"bufferToString", BufferToString, 2},
-            {"bufferConcat", BufferConcat, 1},
-            {"bufferLength", BufferLength, 1},
             {"md5", Md5, 1},
             {"aesEncrypt", AesEncrypt, 4},
             {"rsaEncrypt", RsaEncrypt, 2},
             {"randomBytes", RandomBytes, 1},
-            {"zeroBytes", ZeroBytes, 1},
             {"deflate", Deflate, 1},
             {"inflate", Inflate, 1},
         };
@@ -829,6 +765,10 @@ private:
     QObject* timerOwner_{nullptr};
     QHash<int, TimerEntry> timers_;
     int nextTimerId_{0};
+    QString requestContext_;
+    bool scriptInitialized_{false};
+    bool executionInterrupted_{false};
+    bool jobLimitExceeded_{false};
     struct UnhandledRejection {
         JSValue promise{JS_UNDEFINED};
         QString message;
@@ -848,12 +788,17 @@ private:
 const QString bootstrapScript = QStringLiteral(R"JS(
 (function () {
     const root = this
-    // Legacy sources execute in a browser preload and commonly access
-    // globalThis.lx. QJSEngine does not provide that alias consistently.
+    // Legacy sources execute in a browser preload and access the same global
+    // object through window, self, and globalThis.
     root.globalThis = root
+    root.window = root
+    root.self = root
     // LX scripts routinely log from request callbacks. Logging must not turn a
     // recoverable network failure into a ReferenceError or leak signed URLs.
-    root.console = { log() {}, info() {}, warn() {}, error() {}, debug() {}, trace() {}, time() {}, timeEnd() {}, clear() {} }
+    root.console = Object.fromEntries(['log', 'info', 'warn', 'error', 'debug', 'trace',
+        'time', 'timeLog', 'timeEnd', 'clear', 'assert', 'count', 'countReset',
+        'dir', 'dirxml', 'table', 'group', 'groupCollapsed', 'groupEnd',
+        'profile', 'profileEnd', 'timeStamp'].map(name => [name, () => {}]))
     root.setTimeout = (callback, delay, ...args) => __lf_bridge.setTimeout(callback, delay, ...args)
     root.clearTimeout = id => __lf_bridge.clearTimeout(id)
     const handlers = Object.create(null)
@@ -898,7 +843,9 @@ const QString bootstrapScript = QStringLiteral(R"JS(
             const requestId = 'http-' + (++root.__lf_request_sequence)
             root.__lf_request_callbacks[requestId] = callback
             try {
-                __lf_bridge.startRequest(requestId, url, JSON.stringify(options || {}))
+                __lf_bridge.startRequest(requestId, url, JSON.stringify(options || {}, (key, value) =>
+                    value && value.type === 'Buffer' && Array.isArray(value.data)
+                        ? {__lf_base64: root.Buffer.from(value.data).toString('base64')} : value))
             } catch (error) {
                 delete root.__lf_request_callbacks[requestId]
                 throw error
@@ -911,69 +858,42 @@ const QString bootstrapScript = QStringLiteral(R"JS(
     }
     root.__lf_request_sequence = 0
     root.__lf_request_callbacks = Object.create(null)
-    function LFBuffer(base64) {
-        this.__lf_base64 = base64 || ''
-        this.length = __lf_bridge.bufferLength(this.__lf_base64)
-    }
-    LFBuffer.prototype.toString = function (encoding) {
-        return __lf_bridge.bufferToString(this.__lf_base64, encoding || 'utf8')
-    }
-    root.Buffer = {
-        isBuffer(value) { return value instanceof LFBuffer },
-        from(value, encoding) {
-            if (value && typeof value.__lf_base64 === 'string') return new LFBuffer(value.__lf_base64)
-            if (typeof value === 'string') return new LFBuffer(__lf_bridge.bufferFromString(value, encoding || 'utf8'))
-            if (Array.isArray(value)) return new LFBuffer(__lf_bridge.bufferFromString(String.fromCharCode(...value), 'binary'))
-            throw new Error('unsupported Buffer.from input')
-        },
-        alloc(size) {
-            if (!Number.isInteger(size) || size < 0 || size > 1048576) throw new Error('invalid buffer size')
-            return new LFBuffer(__lf_bridge.zeroBytes(size))
-        },
-        concat(values) {
-            if (!Array.isArray(values)) throw new Error('Buffer.concat expects an array')
-            return new LFBuffer(__lf_bridge.bufferConcat(values.map(value => value.__lf_base64 || '')))
-        }
-    }
+    const fromBase64 = value => root.Buffer.from(value, 'base64')
     root.lx.utils = {
         crypto: {
-            md5(value) { return __lf_bridge.md5(String(value)) },
-            randomBytes(size) { return new LFBuffer(__lf_bridge.randomBytes(size)) },
+            md5(value) { return __lf_bridge.md5(root.Buffer.from(value).__lf_base64) },
+            randomBytes(size) { return fromBase64(__lf_bridge.randomBytes(size)) },
             aesEncrypt(value, mode, key, iv) {
-                if (!value || !key || !iv || typeof value.__lf_base64 !== 'string' ||
-                    typeof key.__lf_base64 !== 'string' || typeof iv.__lf_base64 !== 'string') {
-                    throw new Error('invalid AES arguments')
-                }
-                const result = __lf_bridge.aesEncrypt(value.__lf_base64, mode, key.__lf_base64, iv.__lf_base64)
+                const result = __lf_bridge.aesEncrypt(root.Buffer.from(value).__lf_base64, mode,
+                    root.Buffer.from(key).__lf_base64, iv == null ? '' : root.Buffer.from(iv).__lf_base64)
                 if (!result) throw new Error('aesEncrypt failed')
-                return new LFBuffer(result)
+                return fromBase64(result)
             },
             rsaEncrypt(value, key) {
-                if (!value || typeof value.__lf_base64 !== 'string' || typeof key !== 'string') {
+                if (typeof key !== 'string') {
                     throw new Error('invalid RSA arguments')
                 }
-                const result = __lf_bridge.rsaEncrypt(value.__lf_base64, key)
+                const result = __lf_bridge.rsaEncrypt(root.Buffer.from(value).__lf_base64, key)
                 if (!result) throw new Error('rsaEncrypt failed')
-                return new LFBuffer(result)
+                return fromBase64(result)
             }
         },
         buffer: {
             from(value, encoding) { return root.Buffer.from(value, encoding) },
             bufToString(value, encoding) {
-                if (!value || typeof value.__lf_base64 !== 'string') throw new Error('invalid buffer')
-                return value.toString(encoding || 'utf8')
+                return root.Buffer.from(value, 'binary').toString(encoding || 'utf8')
             }
         },
         zlib: {
             inflate(value) {
-                if (!value || typeof value.__lf_base64 !== 'string') return Promise.reject(new Error('invalid buffer'))
-                const result = __lf_bridge.inflate(value.__lf_base64)
-                return result ? Promise.resolve(new LFBuffer(result)) : Promise.reject(new Error('inflate failed'))
+                try {
+                    return Promise.resolve(fromBase64(__lf_bridge.inflate(root.Buffer.from(value).__lf_base64)))
+                } catch (error) { return Promise.reject(error) }
             },
             deflate(value) {
-                if (!value || typeof value.__lf_base64 !== 'string') return Promise.reject(new Error('invalid buffer'))
-                const result = __lf_bridge.deflate(value.__lf_base64)
-                return result ? Promise.resolve(new LFBuffer(result)) : Promise.reject(new Error('deflate failed'))
+                try {
+                    return Promise.resolve(fromBase64(__lf_bridge.deflate(root.Buffer.from(value).__lf_base64)))
+                } catch (error) { return Promise.reject(error) }
             }
         }
     }
@@ -990,7 +910,7 @@ const QString bootstrapScript = QStringLiteral(R"JS(
             callback(parseError, null, null)
             return false
         }
-        if (packet.response && packet.response.rawBase64) {
+        if (packet.response && typeof packet.response.rawBase64 === 'string') {
             packet.response.raw = root.Buffer.from(packet.response.rawBase64, 'base64')
         }
         if (packet.response) packet.response.body = packet.body
@@ -1104,7 +1024,15 @@ QJsonObject parseScriptMetadata(const QByteArray& source) {
 class PluginRuntime::Impl final {
 public:
     explicit Impl(PluginRuntime& owner)
-        : owner_(owner), network_(std::make_unique<QNetworkAccessManager>(&owner)) {}
+        : owner_(owner), network_(std::make_unique<QNetworkAccessManager>(&owner)), loadDeadline_(&owner) {
+        loadDeadline_.setSingleShot(true);
+        QObject::connect(&loadDeadline_, &QTimer::timeout, &owner_, [this] {
+            if (loadingRequest_.isEmpty()) return;
+            const auto id = loadingRequest_;
+            reset();
+            respondError(id, QStringLiteral("plugin.init-timeout"), QStringLiteral("音源初始化超时"));
+        });
+    }
 
     void handle(const SourceMessage& request) {
         switch (request.type) {
@@ -1125,7 +1053,27 @@ private:
         QString source;
         QString action;
         QString type;
+        QTimer* deadline{nullptr};
     };
+
+    PendingRequest takePending(const QString& id) {
+        auto request = pending_.take(id);
+        if (request.deadline) {
+            request.deadline->stop();
+            request.deadline->deleteLater();
+            request.deadline = nullptr;
+        }
+        return request;
+    }
+
+    void clearPending() {
+        for (const auto& request : std::as_const(pending_)) {
+            if (!request.deadline) continue;
+            request.deadline->stop();
+            request.deadline->deleteLater();
+        }
+        pending_.clear();
+    }
 
     struct PendingTerminal {
         quint64 generation{0};
@@ -1167,7 +1115,7 @@ private:
         const QUrl parsedUrl(url);
         if (!parsedUrl.isValid() ||
             (parsedUrl.scheme() != QStringLiteral("http") && parsedUrl.scheme() != QStringLiteral("https")) ||
-            parsedUrl.host().isEmpty() || url.size() > MaxUrlBytes) {
+            parsedUrl.host().isEmpty() || url.toUtf8().size() > MaxNetworkUrlBytes) {
             return QStringLiteral("invalid request URL");
         }
         if (optionsJson.toUtf8().size() > MaxNetworkRequestBytes) {
@@ -1197,7 +1145,9 @@ private:
             networkRequest.setRawHeader(name, value);
         }
 
-        const int timeout = qBound(1, options.value(QStringLiteral("timeout")).toInt(60000), 60000);
+        const int requestedTimeout = options.value(QStringLiteral("timeout")).toInt();
+        const int timeout = requestedTimeout > 0 ? qMin(requestedTimeout, PluginOperationTimeoutMs)
+                                                : PluginOperationTimeoutMs;
         networkRequest.setTransferTimeout(timeout);
         QByteArray body;
         QHttpMultiPart* multiPart = nullptr;
@@ -1206,7 +1156,7 @@ private:
         } else if (options.value(QStringLiteral("body")).isObject()) {
             const auto bodyObject = options.value(QStringLiteral("body")).toObject();
             const auto encoded = bodyObject.value(QStringLiteral("__lf_base64")).toString();
-            if (!encoded.isEmpty()) {
+            if (bodyObject.value(QStringLiteral("__lf_base64")).isString()) {
                 body = QByteArray::fromBase64(encoded.toLatin1(), QByteArray::AbortOnBase64DecodingErrors);
             } else {
                 // Legacy LX sources commonly pass a plain object for JSON bodies.
@@ -1214,9 +1164,11 @@ private:
             }
         } else if (options.value(QStringLiteral("form")).isObject()) {
             const QJsonObject form = options.value(QStringLiteral("form")).toObject();
-            QUrlQuery query;
-            for (auto it = form.begin(); it != form.end(); ++it) query.addQueryItem(it.key(), it.value().toString());
-            body = query.toString(QUrl::FullyEncoded).toUtf8();
+            for (auto it = form.begin(); it != form.end(); ++it) {
+                if (!body.isEmpty()) body += '&';
+                body += QUrl::toPercentEncoding(it.key()) + '=' +
+                        QUrl::toPercentEncoding(it.value().toVariant().toString());
+            }
             if (!networkRequest.hasRawHeader("Content-Type")) {
                 networkRequest.setHeader(QNetworkRequest::ContentTypeHeader,
                                          QStringLiteral("application/x-www-form-urlencoded"));
@@ -1284,7 +1236,6 @@ private:
         } else if (method == "GET") reply = network_->get(networkRequest);
         else if (method == "POST") reply = network_->post(networkRequest, body);
         else if (method == "PUT") reply = network_->put(networkRequest, body);
-        else if (method == "DELETE") reply = network_->deleteResource(networkRequest);
         else reply = network_->sendCustomRequest(networkRequest, method, body);
         if (!reply) {
             delete multiPart;
@@ -1347,7 +1298,15 @@ private:
             reply->deleteLater();
             return;
         }
-        if (reply->error() != QNetworkReply::NoError) {
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const auto networkError = reply->error();
+        // Qt classifies HTTP 4xx/5xx as reply errors. Needle (LX) delivers
+        // these as responses; plugins need their body to handle fallback and
+        // rate limiting. Transport/TLS/truncated-body errors remain errors.
+        const bool httpError = status >= 400 &&
+            ((networkError >= QNetworkReply::ContentAccessDenied && networkError <= QNetworkReply::UnknownContentError) ||
+             (networkError >= QNetworkReply::InternalServerError && networkError <= QNetworkReply::UnknownServerError));
+        if (networkError != QNetworkReply::NoError && !httpError) {
             completeNetworkRequestForPlugin(requestId, pluginRequestId, reply->errorString(), {});
             reply->deleteLater();
             return;
@@ -1355,17 +1314,16 @@ private:
 
         QJsonValue body = QString::fromUtf8(raw);
         QJsonParseError parseError;
-        const QJsonDocument bodyDocument = QJsonDocument::fromJson(raw, &parseError);
+        const QJsonValue parsedBody = QJsonValue::fromJson(raw, &parseError);
         if (parseError.error == QJsonParseError::NoError) {
-            if (bodyDocument.isObject()) body = bodyDocument.object();
-            else if (bodyDocument.isArray()) body = bodyDocument.array();
+            body = parsedBody;
         }
         QJsonObject response;
         response.insert(QStringLiteral("statusCode"), reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt());
-        response.insert(QStringLiteral("statusMessage"), QString());
+        response.insert(QStringLiteral("statusMessage"), reply->attribute(QNetworkRequest::HttpReasonPhraseAttribute).toString());
         QJsonObject responseHeaders;
         const auto headers = reply->rawHeaderPairs();
-        for (const auto& header : headers) responseHeaders.insert(QString::fromUtf8(header.first), QString::fromUtf8(header.second));
+        for (const auto& header : headers) responseHeaders.insert(QString::fromLatin1(header.first).toLower(), QString::fromLatin1(header.second));
         response.insert(QStringLiteral("headers"), responseHeaders);
         response.insert(QStringLiteral("bytes"), raw.size());
         response.insert(QStringLiteral("rawBase64"), QString::fromLatin1(raw.toBase64()));
@@ -1382,15 +1340,22 @@ private:
                                          const QJsonObject& packet) {
         const QString previousActiveRequest = activePluginRequest_;
         activePluginRequest_ = pluginRequestId;
+        if (engine_) engine_->setRequestContext(pluginRequestId);
         completeNetworkRequest(requestId, error, packet);
         activePluginRequest_ = previousActiveRequest;
+        if (engine_) engine_->setRequestContext(previousActiveRequest);
     }
 
     void completeNetworkRequest(const QString& requestId, const QString& error, const QJsonObject& packet) {
         if (!engine_) return;
         const QString packetJson = QString::fromUtf8(QJsonDocument(packet).toJson(QJsonDocument::Compact));
         QString scriptError;
-        if (!engine_->completeNetworkRequest(requestId, error, packetJson, &scriptError)) {
+        engine_->completeNetworkRequest(requestId, error, packetJson, &scriptError);
+        finishAsyncTurn(scriptError, engine_->failureIsFatal());
+    }
+
+    void finishAsyncTurn(const QString& scriptError, bool fatal) {
+        if (!scriptError.isEmpty() && (!initialized_ || fatal)) {
             failRuntime(scriptError);
             return;
         }
@@ -1400,6 +1365,7 @@ private:
     }
 
     bool abortPluginNetworkRequests(const QString& pluginRequestId, QString* error) {
+        if (engine_) engine_->cancelRequestTimers(pluginRequestId);
         const auto networkIds = pluginNetworkRequests_.take(pluginRequestId);
         for (const auto& networkId : networkIds) {
             if (engine_ && !engine_->dropNetworkRequest(networkId, error)) return false;
@@ -1410,7 +1376,10 @@ private:
 
     bool rejectPendingRequests(const QString& code, const QString& message) {
         QStringList requestIds = pending_.keys();
-        if (!loadingRequest_.isEmpty()) requestIds.append(loadingRequest_);
+        if (!loadingRequest_.isEmpty()) {
+            loadDeadline_.stop();
+            respondError(std::exchange(loadingRequest_, {}), code, message);
+        }
         for (const auto& requestId : requestIds) {
             if (!pending_.contains(requestId)) continue;
             QString cleanupError;
@@ -1418,7 +1387,7 @@ private:
                 failRuntime(cleanupError);
                 return false;
             }
-            pending_.remove(requestId);
+            takePending(requestId);
             respondError(requestId, code, message);
         }
         return true;
@@ -1430,8 +1399,8 @@ private:
                                            : message.left(4096);
         QStringList requestIds = pending_.keys();
         if (!loadingRequest_.isEmpty()) requestIds.append(loadingRequest_);
-        pending_.clear();
         reset();
+        if (requestIds.isEmpty()) requestIds.append(QString{});
         for (const auto& requestId : requestIds) {
             respondError(requestId, QStringLiteral("plugin.runtime-failed"), boundedMessage);
         }
@@ -1458,11 +1427,12 @@ private:
     }
 
     void reset() {
+        loadDeadline_.stop();
         loadingRequest_.clear();
         ++runtimeGeneration_;
         pendingTerminals_.clear();
         queuedTerminalRequestIds_.clear();
-        pending_.clear();
+        clearPending();
         for (auto reply : std::as_const(pendingNetwork_)) {
             if (!reply) continue;
             QObject::disconnect(reply, nullptr, &owner_, nullptr);
@@ -1530,8 +1500,11 @@ private:
                 return startNetworkRequest(id, url, options);
             },
             [this](const QString& id) { abortNetworkRequest(id); },
-            [this, generation](const QString& error) {
-                if (generation == runtimeGeneration_) failRuntime(error);
+            [this, generation](const QString& id) {
+                if (generation == runtimeGeneration_) activePluginRequest_ = id;
+            },
+            [this, generation](const QString&, const QString& error, bool fatal) {
+                if (generation == runtimeGeneration_) finishAsyncTurn(error, fatal);
             },
         });
         if (!engine_->isValid()) {
@@ -1544,7 +1517,11 @@ private:
             return;
         }
         QString scriptError;
-        if (!engine_->evaluate(bootstrapScript, info.absoluteFilePath(), &scriptError)) {
+        QFile browserScript(QStringLiteral(":/sourcehost/browser.js"));
+        if (!browserScript.open(QIODevice::ReadOnly) ||
+            !engine_->evaluate(QString::fromUtf8(browserScript.readAll()),
+                               QStringLiteral("sourcehost/browser.js"), &scriptError) ||
+            !engine_->evaluate(bootstrapScript, QStringLiteral("sourcehost/lx-compat.js"), &scriptError)) {
             reset();
             respondError(request.requestId, QStringLiteral("plugin.bootstrap-failed"), scriptError);
             return;
@@ -1559,7 +1536,7 @@ private:
         // LX marks a source ready when it sends `inited`. Its browser preload
         // ignores script errors raised after that event, so a late exception
         // must not discard an already registered request handler.
-        if (!evaluated && !initialized_) {
+        if (!evaluated && (!initialized_ || engine_->failureIsFatal())) {
             reset();
             respondError(request.requestId, QStringLiteral("plugin.script-failed"), scriptError);
             return;
@@ -1576,21 +1553,16 @@ private:
             }
             return;
         }
-        if (!initialized_ && !pendingNetwork_.isEmpty()) {
+        if (!initialized_ && (!pendingNetwork_.isEmpty() || engine_->hasPendingTasks())) {
             loadingRequest_ = request.requestId;
-            const auto generation = runtimeGeneration_;
-            QTimer::singleShot(30000, &owner_, [this, generation] {
-                if (generation != runtimeGeneration_ || loadingRequest_.isEmpty()) return;
-                const auto id = std::exchange(loadingRequest_, {});
-                reset();
-                respondError(id, QStringLiteral("plugin.init-timeout"), QStringLiteral("音源初始化超时"));
-            });
+            loadDeadline_.start(PluginOperationTimeoutMs);
             return;
         }
         finishLoad(request.requestId);
     }
 
     void finishLoad(const QString& requestId) {
+        loadDeadline_.stop();
         if (!initialized_ ||
             !initPayload_.value(QStringLiteral("status")).toBool(true)) {
             QString diagnosticError;
@@ -1639,12 +1611,18 @@ private:
         const QString targetId = request.payload.value(QStringLiteral("requestId")).toString().isEmpty()
                                      ? request.requestId
                                      : request.payload.value(QStringLiteral("requestId")).toString();
+        if (targetId == loadingRequest_) {
+            reset();
+            respond(request.requestId, MessageType::Result,
+                    {{QStringLiteral("ok"), true}, {QStringLiteral("cancelled"), targetId}});
+            return;
+        }
         QString cleanupError;
         if (!abortPluginNetworkRequests(targetId, &cleanupError)) {
             failRuntime(cleanupError);
             return;
         }
-        pending_.remove(targetId);
+        takePending(targetId);
         respond(request.requestId, MessageType::Result,
                 {{QStringLiteral("ok"), true}, {QStringLiteral("cancelled"), targetId}});
         drainTerminals();
@@ -1678,7 +1656,13 @@ private:
                          QStringLiteral("Source, quality or musicInfo is not supported."));
             return;
         }
-        pending_.insert(request.requestId, {source, action, type});
+        auto* deadline = new QTimer(&owner_);
+        deadline->setSingleShot(true);
+        pending_.insert(request.requestId, {source, action, type, deadline});
+        QObject::connect(deadline, &QTimer::timeout, &owner_, [this, id = request.requestId] {
+            handleRejected(id, QStringLiteral("音源解析超时"));
+        });
+        deadline->start(PluginOperationTimeoutMs);
         QJsonObject info;
         info.insert(QStringLiteral("type"), type);
         info.insert(QStringLiteral("musicInfo"), musicInfo);
@@ -1688,11 +1672,13 @@ private:
         event.insert(QStringLiteral("info"), info);
         const QString previousActiveRequest = activePluginRequest_;
         activePluginRequest_ = request.requestId;
+        engine_->setRequestContext(request.requestId);
         QString scriptError;
         const bool accepted = engine_->dispatch(
             request.requestId,
             QString::fromUtf8(QJsonDocument(event).toJson(QJsonDocument::Compact)), &scriptError);
         activePluginRequest_ = previousActiveRequest;
+        engine_->setRequestContext(previousActiveRequest);
         if (!accepted) {
             if (!scriptError.isEmpty()) {
                 failRuntime(scriptError);
@@ -1712,6 +1698,7 @@ private:
         if (name == QStringLiteral("inited") && !initialized_) {
             initialized_ = true;
             initPayload_ = document.object();
+            if (engine_) engine_->markInitialized();
         } else if (name == QStringLiteral("updateAlert") && updateAlert_.isEmpty()) {
             const auto payload = document.object();
             const auto log = payload.value(QStringLiteral("log")).toString();
@@ -1737,7 +1724,7 @@ private:
             failRuntime(cleanupError);
             return;
         }
-        const auto pending = pending_.take(requestId);
+        const auto pending = takePending(requestId);
         QJsonParseError parseError;
         const QJsonValue value = QJsonValue::fromJson(json.toUtf8(), &parseError);
         if (parseError.error != QJsonParseError::NoError) {
@@ -1799,7 +1786,7 @@ private:
             failRuntime(cleanupError);
             return;
         }
-        pending_.remove(requestId);
+        takePending(requestId);
         respondError(requestId, QStringLiteral("plugin.request-failed"), message);
     }
 
@@ -1809,6 +1796,7 @@ private:
     QJsonObject initPayload_;
     QJsonObject updateAlert_;
     QString loadingRequest_;
+    QTimer loadDeadline_;
     QHash<QString, PendingRequest> pending_;
     QHash<QString, QNetworkReply*> pendingNetwork_;
     QHash<QString, QSet<QString>> pluginNetworkRequests_;
@@ -1822,6 +1810,7 @@ private:
 };
 
 PluginRuntime::PluginRuntime(QObject* parent) : QObject(parent), impl_(std::make_unique<Impl>(*this)) {
+    initializeBrowserResources();
     // The dispatch function is resolved after each load; keeping this signal
     // connection local ensures all script callbacks stay on the SourceHost
     // event-loop thread.

@@ -1,4 +1,4 @@
-ListenFree 0.3.7 · Windows x64
+ListenFree 0.3.8 · Windows x64
 
 安装版：运行 Setup.exe，默认安装到当前用户的应用目录。无需管理员权限。
 便携版：完整解压 ZIP，在可写目录运行 listenfree.exe，不要单独复制 EXE。

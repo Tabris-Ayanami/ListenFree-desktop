@@ -7,6 +7,8 @@
 #include <QMessageBox>
 #include <QPainter>
 #include <QPixmapCache>
+#include <QMetaProperty>
+#include <QPlatformSurfaceEvent>
 #include <QQmlEngine>
 #include <QSettings>
 #include <QStandardPaths>
@@ -35,6 +37,17 @@ PlatformSettings::PlatformSettings(QQuickWindow *window, QObject *shell,
     : QObject(parent), window_(window), shell_(shell), settings_(settings),
       player_(player), lists_(lists), db_(db), library_(library) {
   window_->installEventFilter(this);
+  windowShapeUpdate_.setSingleShot(true);
+  connect(&windowShapeUpdate_, &QTimer::timeout, this, &PlatformSettings::applyWindowShape);
+  connect(window_, &QWindow::widthChanged, this, &PlatformSettings::scheduleWindowShape);
+  connect(window_, &QWindow::heightChanged, this, &PlatformSettings::scheduleWindowShape);
+  connect(window_, &QWindow::screenChanged, this, &PlatformSettings::scheduleWindowShape);
+  connect(window_, &QWindow::visibilityChanged, this, &PlatformSettings::scheduleWindowShape);
+  const auto radiusProperty = window_->metaObject()->property(window_->metaObject()->indexOfProperty("cornerRadius"));
+  if (radiusProperty.hasNotifySignal()) {
+    connect(window_, radiusProperty.notifySignal(), this,
+            metaObject()->method(metaObject()->indexOfSlot("scheduleWindowShape()")));
+  }
   menu_.addAction(tr("显示 ListenFree"), this, [this] {
     window_->showNormal();
     window_->raise();
@@ -287,6 +300,22 @@ void PlatformSettings::updateMediaSession() {
   mediaSession_->update(state);
 }
 bool PlatformSettings::eventFilter(QObject *watched, QEvent *event) {
+  if (watched == window_) {
+    if (event->type() == QEvent::PlatformSurface) {
+      shapedWindow_ = nullptr;
+      const auto* surface = static_cast<QPlatformSurfaceEvent*>(event);
+      if (surface->surfaceEventType() == QPlatformSurfaceEvent::SurfaceAboutToBeDestroyed)
+        windowShapeUpdate_.stop();
+      else {
+        // A new HWND needs both backdrop configuration and the matching shape.
+        QTimer::singleShot(0, this, &PlatformSettings::applyTransparency);
+      }
+    } else if (event->type() == QEvent::Resize || event->type() == QEvent::Show ||
+               event->type() == QEvent::WindowStateChange ||
+               event->type() == QEvent::DevicePixelRatioChange || event->type() == QEvent::ScreenChangeInternal) {
+      scheduleWindowShape();
+    }
+  }
   if(watched==window_ && (event->type()==QEvent::ApplicationPaletteChange || event->type()==QEvent::ThemeChange))applyTransparency();
   if (watched != window_ || event->type() != QEvent::Close || quitting_)
     return false;
@@ -393,11 +422,46 @@ void PlatformSettings::applyTransparency() {
   BOOL composition=false;DwmIsCompositionEnabled(&composition);
   const bool wanted=settings_.value("window.transparencyEnabled",true).toBool() && composition && !(contrast.dwFlags&HCF_HIGHCONTRASTON) && personalize.value("EnableTransparency",1).toBool();
   const HWND hwnd=reinterpret_cast<HWND>(window_->winId());
-  // DWMWA_SYSTEMBACKDROP_TYPE / DWMSBT_TRANSIENTWINDOW (Win11 22H2+).
-  const int backdrop=wanted?3:1;
-  const bool supported=SUCCEEDED(DwmSetWindowAttribute(hwnd,38,&backdrop,sizeof(backdrop)));
-  const MARGINS margins=wanted&&supported?MARGINS{-1,-1,-1,-1}:MARGINS{0,0,0,0};
+  // A whole-HWND system backdrop ignores our custom 32-DIP alpha boundary,
+  // including SetWindowRgn. Use Qt's per-pixel alpha composition instead;
+  // the existing QML shader exposes the desktop only through the sidebar.
+  const int backdrop=1; // DWMWA_SYSTEMBACKDROP_TYPE / DWMSBT_NONE (Win11 22H2+).
+  DwmSetWindowAttribute(hwnd,38,&backdrop,sizeof(backdrop));
+  // Glass extension permits alpha in Qt's redirected D3D surface; it is not
+  // a system backdrop material. Keep it only while desktop alpha is wanted.
+  const MARGINS margins=wanted?MARGINS{-1,-1,-1,-1}:MARGINS{0,0,0,0};
   DwmExtendFrameIntoClientArea(hwnd,&margins);
-  transparencyActive_=wanted&&supported;shell_->setProperty("desktopTransparencyActive",transparencyActive_);
+  transparencyActive_=wanted && window_->format().alphaBufferSize()>0 && window_->color().alpha()==0;
+  shell_->setProperty("desktopTransparencyActive",transparencyActive_);
+  scheduleWindowShape();
+}
+
+void PlatformSettings::scheduleWindowShape() {
+  windowShapeUpdate_.start(0);
+}
+
+void PlatformSettings::applyWindowShape() {
+  if (!window_->handle() || window_->windowState() == Qt::WindowMinimized) return;
+  const auto hwnd = reinterpret_cast<HWND>(window_->winId());
+  RECT bounds{};
+  if (!GetWindowRect(hwnd, &bounds)) return;
+  const QSize size(bounds.right-bounds.left, bounds.bottom-bounds.top);
+  if (size.isEmpty()) return;
+  const bool square = window_->windowState() == Qt::WindowMaximized ||
+                      window_->windowState() == Qt::WindowFullScreen;
+  const int radius = square ? 0 : qBound(0, qRound(window_->property("cornerRadius").toReal()*window_->devicePixelRatio()),
+                                        qMin(size.width(),size.height())/2);
+  if (shapedWindow_ == hwnd && shapedSize_ == size && shapedRadius_ == radius) return;
+  // Clip the native backdrop as well as the QML scene. Win32 takes ownership
+  // of a successful region; the physical geometry avoids fractional-DPI loss.
+  HRGN region = radius > 0 ? CreateRoundRectRgn(0,0,size.width()+1,size.height()+1,radius*2,radius*2) : nullptr;
+  if (radius > 0 && !region) return;
+  if (!SetWindowRgn(hwnd,region,TRUE)) {
+    if (region) DeleteObject(region);
+    return;
+  }
+  shapedWindow_ = hwnd;
+  shapedSize_ = size;
+  shapedRadius_ = radius;
 }
 } // namespace listenfree

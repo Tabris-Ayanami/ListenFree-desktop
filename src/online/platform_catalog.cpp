@@ -90,13 +90,15 @@ QVariantMap song(const QString &platform, QJsonObject o) {
     extra["hash"] = hash;
     extra["albumId"] =
         o.value(o.contains("AlbumID") ? "AlbumID" : "album_id").toVariant();
+    extra["albumAudioId"] = o.value(o.contains("MixSongID") ? "MixSongID" : "mixsongid").toVariant();
     QVariantMap types;
     for (const auto &pair :
          {qMakePair("128k", "FileHash"), qMakePair("320k", "HQFileHash"),
-          qMakePair("flac", "SQFileHash")}) {
+          qMakePair("flac", "SQFileHash"), qMakePair("flac24bit", "ResFileHash")}) {
       QString h = str(o.value(pair.second));
       if (h.isEmpty())
-        h = str(o.value(QString(pair.first) == "flac"   ? "sqhash"
+        h = str(o.value(QString(pair.first) == "flac24bit" ? "ResFileHash"
+                        : QString(pair.first) == "flac"   ? "sqhash"
                         : QString(pair.first) == "320k" ? "320hash"
                                                         : "hash"));
       if (!h.isEmpty())
@@ -119,6 +121,13 @@ QVariantMap song(const QString &platform, QJsonObject o) {
         o.value("file").toObject().value("media_mid").toString();
     extra["songId"] = o.value("id").toVariant();
     extra["albumMid"] = mid;
+    QVariantMap types;
+    const auto file = o.value("file").toObject();
+    for (const auto &pair : {qMakePair("128k", "size_128mp3"), qMakePair("320k", "size_320mp3"),
+                            qMakePair("flac", "size_flac"), qMakePair("flac24bit", "size_hires")})
+      if (file.value(pair.second).toDouble() > 0)
+        types[pair.first] = QVariantMap{{"size", file.value(pair.second).toVariant()}};
+    extra["_types"] = types;
   } else if (platform == "mg") {
     id = str(o.value("songId"));
     if (id.isEmpty())
@@ -535,10 +544,23 @@ QStringList platformSuggestions(const QString &p, const QJsonObject &o) {
 QVariantMap sourceMusicInfo(const QVariantMap &track) {
   auto info = track;
   info["songmid"] = track.value("songmid", track.value("rid"));
-  info["name"] = track.value("title");
-  info["singer"] = track.value("artist");
-  info["albumName"] = track.value("album");
-  info["img"] = track.value("artwork");
+  info["name"] = track.value("title", track.value("name"));
+  info["singer"] = track.value("artist", track.value("singer"));
+  info["albumName"] = track.value("album", track.value("albumName"));
+  info["img"] = track.value("artwork", track.value("img"));
+  info["interval"] = track.value("duration", track.value("interval"));
+  if (track.value("source") == "tx") info["albumId"] = track.value("albumMid");
+  if (!info.contains("types")) {
+    QVariantList types;
+    const auto mapped = track.value("_types").toMap();
+    for (auto it = mapped.cbegin(); it != mapped.cend(); ++it) {
+      auto item = it.value().toMap();
+      item["type"] = it.key();
+      types.append(item);
+    }
+    info["types"] = types;
+  }
+  if (!info.contains("typeUrl")) info["typeUrl"] = QVariantMap{};
   return info;
 }
 QVariantList platformPlaylists(const QString &p, const QJsonObject &object) {

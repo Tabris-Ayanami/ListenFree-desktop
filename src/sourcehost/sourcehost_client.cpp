@@ -286,6 +286,8 @@ bool SourceHostClient::request(const SourceMessage& message, int timeoutMs) {
     timer->setSingleShot(true);
     const QString requestId = message.requestId;
     connect(timer, &QTimer::timeout, this, [this, requestId] {
+        if (!pending_.contains(requestId)) return;
+        sendCancellation(requestId);
         if (!finishRequest(requestId, RequestTerminal::TimedOut)) return;
         emit requestTimedOut(requestId);
     });
@@ -310,7 +312,7 @@ bool SourceHostClient::loadPlugin(const std::filesystem::path& path) {
 #else
     message.payload.insert(QStringLiteral("path"), QString::fromStdString(path.string()));
 #endif
-    return request(message, 5000);
+    return request(message, PluginClientTimeoutMs);
 }
 
 void SourceHostClient::cancel(const std::string& requestId) {
@@ -320,7 +322,13 @@ void SourceHostClient::cancel(const std::string& requestId) {
         emit protocolError(QStringLiteral("request-id-too-large"));
         return;
     }
-    if (!finishRequest(id, RequestTerminal::Cancelled)) return;
+    if (!pending_.contains(id)) return;
+    sendCancellation(id);
+    finishRequest(id, RequestTerminal::Cancelled);
+}
+
+void SourceHostClient::sendCancellation(const QString& id) {
+    if (!running() || !handshakeComplete_) return;
     SourceMessage message;
     message.type = MessageType::Cancel;
     message.requestId = id;

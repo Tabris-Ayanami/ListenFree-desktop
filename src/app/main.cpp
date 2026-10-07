@@ -25,6 +25,7 @@
 #include "qmlbridge/wallpaper_library.h"
 #include "interface_translator.h"
 #include "../../tools/integration_completion_regression.h"
+#include "../../tools/window_corner_regression.h"
 #include "../../tools/portable_acceptance.h"
 #include "../../tools/interaction_regression.h"
 #include "../../tools/new_todo_regression.h"
@@ -62,7 +63,7 @@ int main(int argc, char* argv[]) {
     app.setWindowIcon(QIcon(":/qt/qml/ListenFree/Bootstrap/music_player_desktop/assets/icons/app.png"));
     app.setApplicationName("ListenFree");
     app.setOrganizationName("ListenFree");
-    app.setApplicationVersion("0.3.7");
+    app.setApplicationVersion("0.3.8");
 #ifdef Q_OS_WIN
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     listenfree::WindowsMediaSession::registerApplicationIdentity("ListenFree.Desktop", "ListenFree");
@@ -230,7 +231,10 @@ int main(int argc, char* argv[]) {
     const auto radioFavoritesIndex=arguments.indexOf("--radio-favorites-regression");
     const auto immersiveIndex=arguments.indexOf("--immersive-regression");
     const auto discQueueIndex=arguments.indexOf("--disc-queue-regression");
-    if(discQueueIndex>=0 && discQueueIndex+1<arguments.size() && arguments.contains("--data-dir")) {
+    const auto cornerIndex=arguments.indexOf("--window-corner-regression");
+    if(cornerIndex>=0 && cornerIndex+1<arguments.size() && arguments.contains("--data-dir")) {
+        runWindowCornerRegression(app,mainWindow,mainShell,settingsController,arguments[cornerIndex+1]);
+    } else if(discQueueIndex>=0 && discQueueIndex+1<arguments.size() && arguments.contains("--data-dir")) {
         runDiscQueueRegression(app,mainWindow,mainShell,settingsController,arguments[discQueueIndex+1]);
     } else if(immersiveIndex>=0 && immersiveIndex+1<arguments.size() && arguments.contains("--data-dir")) {
         runImmersiveRegression(app,mainWindow,mainShell,immersive,settingsController,arguments[immersiveIndex+1]);

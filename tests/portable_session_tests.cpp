@@ -467,6 +467,88 @@ private slots:
         player.stop();
     }
 
+    void sourceKeepsSpecificRemoteError() {
+        qmlbridge::SourceController source(nullptr,
+            QCoreApplication::applicationDirPath()+"/listenfree-sourcehost.exe", true);
+        QTRY_VERIFY_WITH_TIMEOUT(source.hostReady(), 5000);
+        QFile script(temporary_.filePath("specific-error.js"));
+        QVERIFY(script.open(QIODevice::WriteOnly));
+        script.write(R"JS(
+lx.send(lx.EVENT_NAMES.inited,{sources:{kw:{type:'music',actions:['musicUrl'],qualitys:['128k']}}});
+lx.on(lx.EVENT_NAMES.request,async()=>{throw Error('fixture-authentication-rejected');});
+)JS");
+        script.close();
+        QVERIFY(source.importLocalFile(script.fileName()));
+        QTRY_VERIFY_WITH_TIMEOUT(source.sources().last().toMap().value("hostReady").toBool(),5000);
+        QSignalSpy results(&source,&qmlbridge::SourceController::resolutionFinished);
+        QVERIFY(!source.resolveMusicUrl(source.activeId(),"128k",{{"source","kw"},{"songmid","450444"}}).isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(results.size(),1,5000);
+        QVERIFY(results.first().at(4).toString().contains("fixture-authentication-rejected"));
+        QVERIFY(source.sources().last().toMap().value("hostReady").toBool());
+    }
+
+    void sourceUsesLegacyOperationBudget() {
+        qmlbridge::SourceController source(nullptr,
+            QCoreApplication::applicationDirPath()+"/listenfree-sourcehost.exe", true);
+        QTRY_VERIFY_WITH_TIMEOUT(source.hostReady(),5000);
+        QFile script(temporary_.filePath("slow-legacy-source.js"));
+        QVERIFY(script.open(QIODevice::WriteOnly));
+        script.write(R"JS(
+setTimeout(()=>lx.send(lx.EVENT_NAMES.inited,{sources:{kw:{type:'music',actions:['musicUrl'],qualitys:['128k']}}}),20);
+lx.on(lx.EVENT_NAMES.request,()=>new Promise(resolve=>setTimeout(()=>resolve('https://media.invalid/slow.mp3'),16000)));
+)JS");
+        script.close();
+        QVERIFY(source.importLocalFile(script.fileName()));
+        QVERIFY(source.resolveMusicUrl(source.activeId(),"128k",{{"source","kw"},{"songmid","450444"}}).isEmpty());
+        QTRY_VERIFY_WITH_TIMEOUT(source.sources().last().toMap().value("hostReady").toBool(),5000);
+        QSignalSpy results(&source,&qmlbridge::SourceController::resolutionFinished);
+        QVERIFY(!source.resolveMusicUrl(source.activeId(),"128k",{{"source","kw"},{"songmid","450444"}}).isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(results.size(),1,20000);
+        QVERIFY2(results.first().at(4).toString().isEmpty(),qPrintable(results.first().at(4).toString()));
+        QCOMPARE(results.first().at(3).toMap().value("url").toString(),QString("https://media.invalid/slow.mp3"));
+    }
+
+    void sourceImportsSameFilenameWithoutOverwrite() {
+        qmlbridge::SourceController source;
+        const auto firstDir = temporary_.filePath("import-first");
+        const auto secondDir = temporary_.filePath("import-second");
+        QVERIFY(QDir().mkpath(firstDir));QVERIFY(QDir().mkpath(secondDir));
+        const auto write = [](const QString& path,const QByteArray& data) {
+            QFile file(path);return file.open(QIODevice::WriteOnly) && file.write(data)==data.size();
+        };
+        const auto first = firstDir+"/script.js", second = secondDir+"/script.js";
+        QVERIFY(write(first,"// first source"));QVERIFY(write(second,"// second source"));
+        QVERIFY(source.importLocalFile(first));const auto firstId=source.activeId();
+        QVERIFY(source.importLocalFile(second));QVERIFY(firstId!=source.activeId());
+        QCOMPARE(source.sources().size(),2);
+        for(const auto& row:source.sources()) {
+            const auto map=row.toMap();QFile stored(map.value("path").toString());
+            QVERIFY(stored.open(QIODevice::ReadOnly));
+            QCOMPARE(stored.readAll(),map.value("id").toString()==firstId ? QByteArray("// first source") : QByteArray("// second source"));
+        }
+        QVERIFY(write(first,"// updated first source"));QVERIFY(source.importLocalFile(first));
+        QCOMPARE(source.sources().size(),2);QCOMPARE(source.activeId(),firstId);
+    }
+
+    void sourceMusicInfoPreservesPlatformContract() {
+        const QJsonObject kgSong{{"Audioid",123},{"FileHash","base"},{"HQFileHash","high"},
+            {"SQFileHash","lossless"},{"ResFileHash","hires"},{"MixSongID",456},{"SongName","song"}};
+        const auto kg=online::sourceMusicInfo(online::platformSongs("kg",{{"data",QJsonObject{{"lists",QJsonArray{kgSong}}}}}).first().toMap());
+        QCOMPARE(kg.value("songmid").toString(),QString("123"));
+        QCOMPARE(kg.value("albumAudioId").toInt(),456);
+        QCOMPARE(kg.value("hash").toString(),QString("base"));
+        QCOMPARE(kg.value("_types").toMap().value("flac24bit").toMap().value("hash").toString(),QString("hires"));
+        QCOMPARE(kg.value("types").toList().size(),4);
+        const QJsonObject txSong{{"id",789},{"mid","song-mid"},{"title","song"},
+            {"album",QJsonObject{{"mid","album-mid"}}},
+            {"file",QJsonObject{{"media_mid","media-mid"},{"size_128mp3",1234},{"size_hires",9999}}}};
+        const auto txRows=online::platformSongs("tx",{{"req",QJsonObject{{"data",QJsonObject{{"body",QJsonObject{{"song",QJsonObject{{"list",QJsonArray{txSong}}}}}}}}}}});
+        QVERIFY(!txRows.isEmpty());const auto tx=online::sourceMusicInfo(txRows.first().toMap());
+        QCOMPARE(tx.value("songmid").toString(),QString("song-mid"));QCOMPARE(tx.value("songId").toInt(),789);
+        QCOMPARE(tx.value("strMediaMid").toString(),QString("media-mid"));
+        QCOMPARE(tx.value("albumId").toString(),QString("album-mid"));QCOMPARE(tx.value("types").toList().size(),2);
+    }
+
     void positionTicksOnlyNotifyProgressBindings() {
         infrastructure::database::Database db;
         const auto path=temporary_.filePath("progress-notify.sqlite");

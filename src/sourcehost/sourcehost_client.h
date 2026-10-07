@@ -72,6 +72,7 @@ private:
     void handleStandardOutput();
     void failHandshake(const QString& reason);
     void processFrames();
+    void sendCancellation(const QString& requestId);
     bool finishRequest(const QString& requestId, RequestTerminal terminal);
     void finishAll(RequestTerminal terminal);
 

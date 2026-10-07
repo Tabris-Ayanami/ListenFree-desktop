@@ -31,13 +31,13 @@ Windows 10/11 x64 原生音乐播放器，使用 Qt Quick、Qmmp、QuickJS-ng �
 
 脚本通过 CMake 构建 Release，部署到 dist/ListenFree-Portable 并做隔离启动检查。重新部署保留该目录的个人 data。CMakePresets.json 提供当前工具链的 portable 预设，可用 CMakeUserPresets.json 覆盖本机路径。
 
-安装 Inno Setup 6 后生成 0.3.7 安装版：
+安装 Inno Setup 6 后生成 0.3.8 安装版：
 
 ```powershell
-./scripts/windows/package-release.ps1 -Version 0.3.7 -InstallerOnly
+./scripts/windows/package-release.ps1 -Version 0.3.8 -InstallerOnly -SkipChecksums
 ```
 
-省略 `-InstallerOnly` 并安装 7-Zip 时，脚本仍可生成便携 ZIP；0.3.7 的 GitHub Release 只发布安装包与更新清单。改动见 [更新说明](packaging/release-notes-0.3.7.txt)。
+省略 `-InstallerOnly` 并安装 7-Zip 时，脚本仍可生成便携 ZIP；0.3.8 的 GitHub Release 仅发布安装包。改动见 [更新说明](packaging/release-notes-0.3.8.txt)。
 
 使用已经验收的运行库目录可传入 `-RuntimeDirectory <目录>`；追加 `-SkipChecksums` 可只生成安装包和便携 ZIP，不生成校验文件。
 
@@ -65,3 +65,15 @@ CMake 从官方 Release 获取已固定 SHA-256 的 WinSparkle x64 包，也可�
 安装版打包脚本同时生成已签名的 appcast.xml，核对签名私钥与 `src/app/update_public_key.h` 中的公钥是否一致，并重新验签。默认私钥位置为 `%LOCALAPPDATA%/ListenFree/ReleaseSigning/winsparkle-private.key`，可用 `-SigningKeyFile` 指定工作区外的备份。**务必备份原私钥；不要提交、上传或重新生成替代密钥，否则已发布版本无法信任后续更新。**
 
 发布时把 Setup.exe 和 appcast.xml 上传同一个 GitHub Release，全部校验完成后再标记为最新正式版。预发布不要设为 latest；无需额外上传 SHA 文件。可单独调用 `scripts/windows/new-update-appcast.ps1` 对安装包签名并生成更新信息。
+
+0.3.8 按本次发行要求只上传 Setup.exe，未上传 appcast.xml，因此请从 Release 页面手动下载升级。本地打包仍生成并验证签名的更新清单，用于内部核验。
+
+## 自定义音源兼容验证
+
+SourceHost 的浏览器 API 使用已提交的离线静态资源，成品无需 Node。生成方式与固定依赖见 src/third_party/sourcehost_browser/README.md。
+
+```powershell
+python tools/test_sourcehost_contract.py --standalone --host dist/ListenFree-Portable/listenfree-sourcehost.exe
+```
+
+该契约回归使用本机 HTTP 测试服务，覆盖字节与加密、URL、HTTP 错误正文、异步初始化、取消及脚本异常。真实音源可用性还依赖其服务、曲目与权限。

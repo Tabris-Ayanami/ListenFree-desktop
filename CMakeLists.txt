@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(ListenFree VERSION 0.3.7 LANGUAGES CXX)
+project(ListenFree VERSION 0.3.8 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -190,6 +190,10 @@ add_library(listenfree_plugin_runtime STATIC
     src/sourcehost/plugin_runtime.cpp
 )
 target_link_libraries(listenfree_plugin_runtime PUBLIC listenfree_source_protocol Qt6::Core Qt6::Network ZLIB::ZLIB qjs)
+qt_add_resources(listenfree_plugin_runtime sourcehost_browser
+    PREFIX "/sourcehost"
+    BASE "src/third_party/sourcehost_browser"
+    FILES src/third_party/sourcehost_browser/browser.js)
 target_include_directories(listenfree_plugin_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 if(WIN32)
     target_link_libraries(listenfree_plugin_runtime PRIVATE bcrypt crypt32)
@@ -279,6 +283,10 @@ if(LISTENFREE_BUILD_QMMP_BACKEND)
     target_link_libraries(listenfree_portable PUBLIC listenfree_qmmp_media listenfree_qmlbridge listenfree_source_client listenfree_qmmp_ui listenfree_qmmp_import Qt6::Widgets Qt6::Network Qt6::Concurrent TagLib::tag ZLIB::ZLIB)
     target_sources(listenfree_portable PRIVATE src/qmlbridge/fume_layout.h src/qmlbridge/folia_scene.h src/qmlbridge/folia_scene.cpp src/qmlbridge/immersive_controller.h src/qmlbridge/immersive_controller.cpp)
     target_link_libraries(listenfree_portable PUBLIC Qt6::Multimedia Qt6::Quick)
+    add_executable(listenfree-source-catalog-probe EXCLUDE_FROM_ALL tools/source_catalog_probe.cpp)
+    target_link_libraries(listenfree-source-catalog-probe PRIVATE listenfree_portable)
+    add_executable(listenfree-source-import-probe EXCLUDE_FROM_ALL tools/source_import_probe.cpp)
+    target_link_libraries(listenfree-source-import-probe PRIVATE listenfree_portable)
     target_sources(listenfree_portable PRIVATE src/qmlbridge/smart_mix.cpp src/media/audio_tail_probe.h src/media/audio_tail_probe.cpp)
     target_sources(listenfree_portable PRIVATE src/media/mv_frame_stream.h src/media/mv_frame_stream.cpp)
     target_sources(listenfree_portable PRIVATE src/media/artwork_video.h src/media/artwork_video.cpp)
